@@ -1,4 +1,4 @@
-# open_qwen36 — Qwen3.6-MoE on open XDNA2 kernels
+# open_qwen36 — Qwen3.6-MoE (and Qwen3 dense) on open XDNA2 kernels
 
 The open replacement for the closed `qwen3_6_moe_npu` engine. It sits behind
 the app's `causal_lm` seam ([engine.hpp](engine.hpp)), so the tokenizer, chat
@@ -101,7 +101,41 @@ The app uses the open engine for `qwen3.6-moe` whenever the kernels are
 installed for the model (`xclbins/<model name>/open_kernels/`, or
 `<model dir>/open_kernels/`, or `FLM_OPEN_KERNELS_DIR`); `FLM_QWEN36_ENGINE=closed`
 forces the closed DLL, `=open` fails loudly if the kernels are missing. XRT
-builds only (`FLM_USE_HRX=OFF`), like the open embedding NPU backend.
+builds only (`FLM_USE_HRX=OFF`), like the open embedding NPU backend. The
+same holds for the `qwen3` dense models (`FLM_QWEN3_ENGINE`): the engine is
+the same code, the manifest is a different recipe's.
+
+## A second family: Qwen3 dense (2026-09-05)
+
+The engine does not know which family it runs. `open_kernels/recipes/qwen3.py`
+turns a Qwen3 dense `config.json` (GQA with q/k RMSNorm, full RoPE, no
+attention gate, silu-gated FFN, a q4_1 lm_head) into a kernel set of three:
+`dx` (the whole layer in one dispatch: `designs/dense/dx.py`, the same 8 main
+cores + norm helper + attention helper as the MoE designs), `ln` at the
+model's width, `lm_head_q4` (the q4 GEMV with an uneven band split). New
+kernel points that came with it, all validated by the layer test: K = 2560 and
+9728 GEMVs (activations that are not a whole number of 4 KB elements are
+prepared by element index), HD 128 attention with 32/8 heads and full RoPE
+(`ATTN_*` macros; the attention core's element is one KV-row half), the
+2560-wide norm (`LN_N`), and the position record's sin placed right after its
+cos (the fixed offset the 27B used only fit 32 values).
+
+```
+python open_kernels/export_qwen36_kernels.py --model-dir ~/.flm/models/Qwen3-4B-NPU2     # WSL
+#   -> src/xclbins/Qwen3-4B-NPU2/open_kernels/{dx,ln,lm_head_q4}/ + manifest.json
+python src\open_qwen36\chat.py "Explain what an NPU is in two sentences." --model %USERPROFILE%\.flm\models\Qwen3-4B-NPU2 --kernels src\xclbins\Qwen3-4B-NPU2\open_kernels
+```
+
+| check (Qwen3-4B, Strix, Windows + XRT) | result |
+|---|---|
+| 4-layer slice, 2 greedy tokens, harness vs the fp64 replica (`model/replica_dense.py`) | logits corr 0.999997 / 0.999994, same argmax and top-5, every layer's residual corr ≥ 0.999996 |
+| the same through the engine (`open_qwen36_cli`, the C++ packer + manifest + attnpos) | identical numbers; request 2 reproduces request 1 |
+| all 36 layers, the NPU prompt, greedy | *An NPU, or Neural Processing Unit, is a specialized piece of hardware designed to accelerate AI workloads, particularly those involving machine learning and neural networks. It is optimized for tasks like inference and training of deep learning models, offering improved efficiency and performance compared to general-purpose CPUs or GPUs.* then `<\|im_end\|>` at token 58 |
+| speed | prefill 129 ms/token, decode 272 ms/token (3.7 tok/s): every token streams the model's 2.3 GB of q4 weights once, which is the floor of this dataflow on the NPU's DDR bandwidth |
+
+`model/dense_probe.py` compares each stage's DDR bounce (xn, q/k/v, og, out,
+res, xm, h, out2) of a dumped `act` buffer with the replica, fed the NPU's own
+input, so a stage's error is localized rather than compounded.
 
 Images still route through the closed engine — the open one refuses an image
 payload with a clear error rather than silently ignoring it.

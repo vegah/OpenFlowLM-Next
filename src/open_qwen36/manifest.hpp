@@ -24,13 +24,14 @@ namespace open_qwen36 {
 /// One packing-plan op: which tensor lands at which byte offset in which
 /// chunk order (open_kernels/recipes/pack.py is the same interpreter in NumPy).
 struct PackOp {
-    std::string op;                          ///< std_perm | expert_stripes | expert_down | put | conv_transpose
+    std::string op;                          ///< std_perm | expert_stripes | expert_down | put | conv_transpose | lmhead_q8
     std::string tensor, up, gate;            ///< tensor names; "{l}" stands for the layer index
     uint64_t dst = 0;
     uint64_t cap = 0;                        ///< put: the slot's capacity
     uint64_t nch = 0, in_dim = 0, chunk0 = 0;                          ///< std_perm
     uint64_t experts = 0, stripes = 0, stripe_bytes = 0, expert_bytes = 0;   ///< expert_stripes / expert_down
     uint64_t taps = 0, groups = 0, width = 0;                           ///< conv_transpose
+    uint64_t chunk_bytes = 0;                                           ///< lmhead_q8
 };
 
 /// One verb of a layer type's (or the tail's) program.
@@ -63,8 +64,9 @@ struct Manifest {
     // layout
     size_t hidden = 0, vocab = 0, real_vocab = 0;
     size_t chunk_bytes = 0, pool_bytes = 0, lmhead_pool_bytes = 0, lmhead_chunk_bytes = 0;
-    size_t kv_row = 0, ptab_row = 0, rotary_dim = 0, rout_idx_off = 0;
+    size_t kv_row = 0, ptab_row = 0, rotary_dim = 0, rout_idx_off = 1024;
     double rope_theta = 0;
+    bool has_moe = false;                    ///< layout.moe present (a family with routed experts)
     stream_patch::MoeGeometry moe;
     stream_patch::AttnGeometry attn;
     // the model and its programs
@@ -75,7 +77,8 @@ struct Manifest {
     std::vector<Step> tail;
     std::map<std::string, uint64_t> globals;          ///< fixed-size global buffers (bytes)
     std::map<std::string, uint64_t> per_row_globals;  ///< globals sized max_ctx x row (the ptab)
-    std::string embed_tensor, norm_tensor, lmhead_tensor;
+    std::string embed_tensor, norm_tensor;
+    std::vector<PackOp> lmhead_ops;          ///< pack.lm_head.ops into the lmpool global
     size_t norm_bytes = 0;
     nlohmann::json hf_config_check;
 

@@ -20,7 +20,15 @@ from pathlib import Path
 from tokenizers import Tokenizer
 
 HERE = Path(__file__).resolve().parent
-IM_START, IM_END, EOT, THINK, END_THINK, NL, NLNL = 248045, 248046, 248044, 248068, 248069, 198, 271
+def special_ids(tk):
+    """<|im_start|>, <|im_end|>, <|endoftext|>, <think>, </think> by name; the newline ids by encoding."""
+    ids = {t: tk.token_to_id(t) for t in ("<|im_start|>", "<|im_end|>", "<|endoftext|>", "<think>", "</think>")}
+    missing = [t for t, i in ids.items() if i is None]
+    if missing:
+        raise SystemExit(f"tokenizer lacks {missing}")
+    nl = tk.encode(chr(10), add_special_tokens=False).ids
+    nlnl = tk.encode(chr(10) * 2, add_special_tokens=False).ids
+    return ids["<|im_start|>"], ids["<|im_end|>"], ids["<|endoftext|>"], ids["<think>"], ids["</think>"], nl, nlnl
 
 
 def main() -> int:
@@ -38,8 +46,9 @@ def main() -> int:
 
     tk = Tokenizer.from_file(str(Path(a.model) / "tokenizer.json"))
     prompt = f"<|im_start|>user\n{a.message}<|im_end|>\n<|im_start|>assistant\n"
+    IM_START, IM_END, EOT, THINK, END_THINK, NL, NLNL = special_ids(tk)
     ids = tk.encode(prompt, add_special_tokens=False).ids
-    ids += [THINK, NL] if a.think else [THINK, NLNL, END_THINK, NLNL]
+    ids += [THINK] + NL if a.think else [THINK] + NLNL + [END_THINK] + NLNL
     print(f"prompt: {len(ids)} ids", file=sys.stderr)
 
     cmd = [a.exe, "--model", a.model, "--kernels", a.kernels, "--ids", ",".join(map(str, ids)),

@@ -47,7 +47,8 @@ PackOp parse_op(const json& j, const std::string& where) {
     p.taps = j.value("taps", 0ull);
     p.groups = j.value("groups", 0ull);
     p.width = j.value("width", 0ull);
-    if (p.op == "std_perm" || p.op == "put" || p.op == "expert_down" || p.op == "conv_transpose") {
+    p.chunk_bytes = j.value("chunk_bytes", 0ull);
+    if (p.op == "std_perm" || p.op == "put" || p.op == "expert_down" || p.op == "conv_transpose" || p.op == "lmhead_q8") {
         if (p.tensor.empty()) fail(where, p.op + " without a tensor");
     } else if (p.op == "expert_stripes") {
         if (p.up.empty() || p.gate.empty()) fail(where, "expert_stripes without up / gate");
@@ -104,13 +105,15 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
     m.chunk_bytes = get<size_t>(lay, "chunk_bytes", lw);
     m.pool_bytes = get<size_t>(lay, "pool_bytes", lw);
     m.lmhead_pool_bytes = get<size_t>(lay, "lmhead_pool_bytes", lw);
-    m.lmhead_chunk_bytes = get<size_t>(lay, "lmhead_chunk_bytes", lw);
+    m.lmhead_chunk_bytes = lay.value("lmhead_chunk_bytes", 0ull);
     m.kv_row = get<size_t>(lay, "kv_row", lw);
     m.ptab_row = get<size_t>(lay, "ptab_row", lw);
     m.rotary_dim = get<size_t>(lay, "rotary_dim", lw);
     m.rope_theta = get<double>(lay, "rope_theta", lw);
-    m.rout_idx_off = get<size_t>(lay, "rout_idx_off", lw);
-    const json& moe = need(lay, "moe", lw);
+    m.rout_idx_off = lay.value("rout_idx_off", 1024ull);
+    m.has_moe = lay.contains("moe");
+    if (m.has_moe) {
+    const json& moe = lay["moe"];
     const std::string mw = lw + ".moe";
     m.moe.experts = get<unsigned>(moe, "experts", mw);
     m.moe.topk = get<unsigned>(moe, "topk", mw);
@@ -122,6 +125,7 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
     m.moe.share_gate = get<uint64_t>(moe, "share_gate", mw);
     m.moe.share_down = get<uint64_t>(moe, "share_down", mw);
     if (m.moe.topk > 8 || m.moe.topk == 0) fail(mw, "topk " + std::to_string(m.moe.topk) + " (the router record holds 8)");
+    }
     m.attn.kv_row = m.kv_row;
     m.attn.ptab_row = m.ptab_row;
 
@@ -135,6 +139,7 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
         d.patch = v.value("patch", "");
         if (!m.contexts.count(d.context)) fail(where, "kernel " + k + " names unknown context " + d.context);
         if (!d.patch.empty() && d.patch != "moeroute2" && d.patch != "attnpos") fail(where, "kernel " + k + ": unknown patch " + d.patch);
+        if (d.patch == "moeroute2" && !m.has_moe) fail(where, "kernel " + k + " wants moeroute2 but layout.moe is absent");
         m.kernels[k] = d;
     }
     for (const auto& [name, v] : need(j, "layer_types", where).items()) {
@@ -171,7 +176,8 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
     m.embed_tensor = get<std::string>(need(pack, "embed", where), "tensor", where + " pack.embed");
     m.norm_tensor = get<std::string>(need(pack, "norm", where), "tensor", where + " pack.norm");
     m.norm_bytes = get<size_t>(need(pack, "norm", where), "bytes", where + " pack.norm");
-    m.lmhead_tensor = get<std::string>(need(pack, "lm_head", where), "tensor", where + " pack.lm_head");
+    for (const auto& o : need(need(pack, "lm_head", where), "ops", where + " pack.lm_head")) m.lmhead_ops.push_back(parse_op(o, where + " pack.lm_head"));
+    if (m.lmhead_ops.empty()) fail(where, "pack.lm_head has no ops");
     m.hf_config_check = need(j, "hf_config_check", where);
     return m;
 }

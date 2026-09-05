@@ -29,15 +29,16 @@ void bounds(const PackOp& op, uint64_t nbytes, size_t dst_bytes) {
 }
 
 /// pool chunk index -> file chunk index for a standard [out, in] matmul tensor:
-/// pool chunk c covers rows 64*(c/per_band) + 32*(c%2) and cols
-/// 1024*((c/8) % (in/1024)) + 256*((c/2)%4); file chunk f covers rows
-/// 32*(f/ncol), cols 256*(f%ncol).
+/// a band is 64 rows x in_dim = in_dim/128 chunks; inside its band chunk i covers
+/// row half i%2 and k-tile i/2 (gemv_q4.h's band law); file chunk f covers rows
+/// 32*(f/ncol), cols 256*(f%ncol). Same law as recipes/pack.py (which documents
+/// its equivalence with the form phlegm verified against FLM's captured pools).
 std::vector<size_t> std_perm(size_t nch, size_t in_dim) {
-    size_t ncol = in_dim / 256, per_band = in_dim / 128, kgroups = in_dim >= 1024 ? in_dim / 1024 : 1;
+    size_t ncol = in_dim / 256, per_band = in_dim / 128;
     std::vector<size_t> perm(nch);
     for (size_t c = 0; c < nch; ++c) {
         size_t rows0 = 64 * (c / per_band) + 32 * (c % 2);
-        size_t cols0 = (1024 * ((c / 8) % kgroups) + 256 * ((c / 2) % 4)) % in_dim;
+        size_t cols0 = 256 * ((c % per_band) / 2);
         perm[c] = (rows0 / 32) * ncol + cols0 / 256;
     }
     return perm;
@@ -108,6 +109,20 @@ void apply(const PackOp& op, const Q4nxFile& m, int layer, uint8_t* dst, size_t 
         if (n > op.cap) fail(name + " is " + std::to_string(n) + " B, its slot holds " + std::to_string(op.cap));
         bounds(op, n, dst_bytes);
         std::memcpy(dst + op.dst, src, n);
+    } else if (op.op == "lmhead_q8") {
+        // 128-row supertile order: pool chunk k <- file chunk (4*(k/32) + (k%4))*8 + ((k%32)/4)
+        const std::string name = with_layer(op.tensor, layer);
+        const size_t CH8 = op.chunk_bytes;
+        if (!CH8) fail("lmhead_q8 without chunk_bytes");
+        size_t n = 0;
+        const uint8_t* src = raw(m, name, 0, &n);
+        size_t nch = n / CH8;
+        bounds(op, nch * CH8, dst_bytes);
+        for (size_t k = 0; k < nch; ++k) {
+            size_t s = k / 32, r = k % 32;
+            size_t fch = (4 * s + r % 4) * 8 + r / 4;
+            std::memcpy(dst + op.dst + k * CH8, src + fch * CH8, CH8);
+        }
     } else if (op.op == "conv_transpose") {
         // conv1d bf16 [taps][groups*width] -> [groups][taps][width]
         const std::string name = with_layer(op.tensor, layer);
@@ -136,24 +151,15 @@ void pack_consts(const Manifest& m, const LayerType& lt, const Q4nxFile& f, int 
 }
 
 void pack_lmhead(const Manifest& m, const Q4nxFile& f, uint8_t* out) {
-    // 128-row supertile order: pool chunk k <- file chunk (4*(k/32) + (k%4))*8 + ((k%32)/4)
-    const size_t CH8 = m.lmhead_chunk_bytes;
-    size_t n = 0;
-    const uint8_t* src = f.raw(m.lmhead_tensor, &n);
-    size_t nch = n / CH8;
-    if (nch * CH8 > m.lmhead_pool_bytes) fail(m.lmhead_tensor + " is larger than its pool");
     std::memset(out, 0, m.lmhead_pool_bytes);
-    for (size_t k = 0; k < nch; ++k) {
-        size_t s = k / 32, r = k % 32;
-        size_t fch = (4 * s + r % 4) * 8 + r / 4;
-        std::memcpy(out + k * CH8, src + fch * CH8, CH8);
-    }
+    for (const auto& op : m.lmhead_ops) apply(op, f, 0, out, m.lmhead_pool_bytes, m.chunk_bytes);
 }
 
 void build_ptab(const Manifest& m, size_t rows, uint8_t* t) {
-    // partial RoPE: rotary_dim of head_dim, half-split pairs (i, i + rot/2), the recipe's theta
+    // RoPE over the first rotary_dim dims of a head, half-split pairs (i, i + rot/2), the recipe's theta:
+    // [i32 pos | i32 nf | cos f32[rot/2] @512 | sin f32[rot/2] right after] (attn.h reads [cos | sin] at +512)
     const size_t half = m.rotary_dim / 2;
-    if (512 + 4 * half > 640 || 640 + 4 * half > m.ptab_row) fail("the rotary dim does not fit the position record");
+    if (512 + 8 * half > m.ptab_row) fail("the rotary dim does not fit the position record");
     std::memset(t, 0, rows * m.ptab_row);
     for (size_t p = 0; p < rows; ++p) {
         uint8_t* r = t + p * m.ptab_row;
@@ -164,7 +170,7 @@ void build_ptab(const Manifest& m, size_t rows, uint8_t* t) {
             double ang = static_cast<double>(p) * std::pow(m.rope_theta, -static_cast<double>(i) / static_cast<double>(half));
             float c = static_cast<float>(std::cos(ang)), s = static_cast<float>(std::sin(ang));
             std::memcpy(r + 512 + 4 * i, &c, 4);
-            std::memcpy(r + 640 + 4 * i, &s, 4);
+            std::memcpy(r + 512 + 4 * half + 4 * i, &s, 4);
         }
     }
 }

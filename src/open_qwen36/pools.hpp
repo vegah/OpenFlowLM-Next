@@ -31,7 +31,7 @@ void apply(const PackOp& op, const Q4nxFile& m, int layer, uint8_t* dst, size_t 
 void pack_pool(const Manifest& m, const LayerType& lt, const Q4nxFile& f, int layer, uint8_t* dst);
 /// The layer's small-weight blob (lt.consts_bytes, fully written).
 void pack_consts(const Manifest& m, const LayerType& lt, const Q4nxFile& f, int layer, uint8_t* dst);
-/// The q8 lm_head pool (m.lmhead_pool_bytes): 128-row supertile order.
+/// The lm_head pool (m.lmhead_pool_bytes): the manifest's pack.lm_head ops.
 void pack_lmhead(const Manifest& m, const Q4nxFile& f, uint8_t* dst);
 /// The position record table: row p = [pos | nf = max(p,1) | cos | sin], `rows` rows of m.ptab_row.
 void build_ptab(const Manifest& m, size_t rows, uint8_t* dst);

@@ -42,7 +42,7 @@ json matching_config(const Manifest& m) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: manifest_test <manifest.json>\n");
+        std::fprintf(stderr, "usage: manifest_test <manifest_qwen36.json> [<manifest_qwen3_4b.json>]\n");
         return 2;
     }
     Manifest m;
@@ -77,7 +77,9 @@ int main(int argc, char** argv) {
     check(full.pool[8].op == "std_perm" && full.pool[8].chunk0 == 1024 && full.pool[8].dst == 511836160, "the fused q|gate split");
     check(m.tail.size() == 2 && m.tail[0].kernel == "ln" && m.tail[1].kernel == "lm" && m.tail[1].args.size() == 3, "tail program");
     check(m.globals.at("logits") == 248320 * 4 && m.globals.at("lmpool") == 542113792 && m.per_row_globals.at("ptab") == 1024, "globals");
-    check(m.embed_tensor == "model.embed_tokens.weight" && m.norm_tensor == "model.norm.weight" && m.lmhead_tensor == "lm_head.weight", "tensor names");
+    check(m.embed_tensor == "model.embed_tokens.weight" && m.norm_tensor == "model.norm.weight" && m.lmhead_ops.size() == 1 &&
+          m.lmhead_ops[0].op == "lmhead_q8" && m.lmhead_ops[0].tensor == "lm_head.weight" && m.lmhead_ops[0].chunk_bytes == 8704, "tensor names");
+    check(m.has_moe, "the 27B manifest carries the MoE geometry");
     check(m.files().size() == 10, "10 files named (4 xclbin + 6 insts)");
 
     // ---- the model check
@@ -115,6 +117,31 @@ int main(int argc, char** argv) {
         check(false, "manifest_version 2 is refused");
     } catch (const std::runtime_error& e) {
         check(std::string(e.what()).find("manifest_version 2") != std::string::npos, std::string("manifest_version 2 is refused: ") + e.what());
+    }
+    // ---- the dense family's manifest: no MoE geometry, one run per layer, a q4 head
+    if (argc >= 3) {
+        Manifest d;
+        try {
+            d = Manifest::load(argv[2]);
+            check(d.family == "qwen3" && d.layers.size() == 36 && d.layers[0] == "dense", "qwen3: 36 dense layers");
+            check(!d.has_moe && d.rout_idx_off == 1024, "qwen3: no MoE geometry");
+            check(d.hidden == 2560 && d.vocab == 151936 && d.real_vocab == 151669 && d.kv_row == 4096 && d.ptab_row == 2048 &&
+                  d.rotary_dim == 128, "qwen3: layout");
+            const auto& lt = d.layer_types.at("dense");
+            check(lt.program.size() == 1 && lt.program[0].op == "run" && lt.program[0].kernel == "dx" && lt.program[0].args.size() == 6 &&
+                  lt.state_kind == "kv" && lt.state_row == 4096, "qwen3: one run per layer");
+            check(d.kernels.at("dx").patch == "attnpos" && d.kernels.count("lm") && d.contexts.size() == 3, "qwen3: kernels");
+            check(lt.pool.size() == 7 && lt.pool[0].op == "std_perm" && lt.pool[0].in_dim == 2560 && lt.consts.size() == 4,
+                  "qwen3: packing plan");
+            check(d.lmhead_ops.size() == 1 && d.lmhead_ops[0].op == "std_perm" && d.lmhead_ops[0].nch == 47480, "qwen3: q4 head");
+            json ok = matching_config(d);
+            d.check_model(ok, "qwen3");
+            check(true, "qwen3: a matching config.json is accepted");
+            json bad = ok; bad["intermediate_size"] = 12288;
+            refused(d, bad, "intermediate_size", "qwen3: an 8B config is refused by name");
+        } catch (const std::exception& e) {
+            check(false, std::string("qwen3 fixture: ") + e.what());
+        }
     }
     std::printf("%s (%d failures)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;

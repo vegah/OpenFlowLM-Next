@@ -14,15 +14,35 @@ Qwen3::Qwen3(flm_rt::device* npu_device_inst) : AutoModel(npu_device_inst, "Qwen
 
 void Qwen3::load_model(std::string model_path, json model_info, int default_context_length, bool enable_preemption) {
     this->_shared_load_model(model_path, model_info, default_context_length, enable_preemption);
-    
-    this->q4nx = std::make_unique<Q4NX>(this->model_path);
-    // lm_config->get<std::string>("model_type", "") == qwen3
-    this->lm_engine = std::make_unique<qwen3_npu>(*this->lm_config, this->npu.get(), this->MAX_L);
 
-    this->lm_engine->load_weights(*this->q4nx);
-
-    //free the q4nx
-    this->q4nx.reset();
+    // The engine: the open one (open_qwen36/, the dense recipe's kernel set
+    // under xclbins/<model>/open_kernels) whenever it is installed for this
+    // model, the closed qwen3_npu DLL otherwise. FLM_QWEN3_ENGINE=open|closed
+    // overrides the choice.
+    bool use_open = false;
+#ifdef FLM_USE_OPEN_QWEN36
+    {
+        const std::string kernels = open_qwen36::Engine::find_kernels(*this->lm_config);
+        const char* sel = std::getenv("FLM_QWEN3_ENGINE");
+        use_open = sel ? std::string(sel) == "open" : !kernels.empty();
+        if (use_open && kernels.empty())
+            throw std::runtime_error("FLM_QWEN3_ENGINE=open but no open kernels were found for " + this->lm_config->model_name);
+        if (use_open) {
+            header_print("FLM", "Qwen3 on the open kernels (" + kernels + ")");
+            auto eng = std::make_unique<open_qwen36::Engine>(*this->lm_config, this->npu_device_inst, this->MAX_L);
+            eng->load_open_weights();
+            this->lm_engine = std::move(eng);
+        }
+    }
+#endif
+    if (!use_open) {
+        this->q4nx = std::make_unique<Q4NX>(this->model_path);
+        // lm_config->get<std::string>("model_type", "") == qwen3
+        this->lm_engine = std::make_unique<qwen3_npu>(*this->lm_config, this->npu.get(), this->MAX_L);
+        this->lm_engine->load_weights(*this->q4nx);
+        //free the q4nx
+        this->q4nx.reset();
+    }
     this->lm_engine->clear_context();
     this->setup_tokenizer(model_path);
     this->sampler.reset();
@@ -81,10 +101,9 @@ bool Qwen3::insert(chat_meta_info_t& meta_info, lm_uniform_input_t& input, std::
 
     // hardware
     int restore_idx = -1;
-    qwen3_npu *qwen3_engine = dynamic_cast<qwen3_npu*>(this->lm_engine.get());
 
     if (meta_info.restore_allowed) {
-        restore_idx = qwen3_engine->restore();
+        restore_idx = this->lm_engine->restore();
         this->total_tokens = restore_idx;
         this->token_history = checkpoint_his; // restore the token history to be consistent with the restored KV cache, which is crucial for correct functioning of _shared_insert's prefix-matching logic
     }
@@ -95,7 +114,7 @@ bool Qwen3::insert(chat_meta_info_t& meta_info, lm_uniform_input_t& input, std::
     bool success = this->_shared_insert(meta_info, tokens, is_cancelled, nullptr);
 
     checkpoint_his = token_history;
-    int checkpoint_idx = qwen3_engine->checkpoint();
+    int checkpoint_idx = this->lm_engine->checkpoint();
     return success;
 }
 
@@ -524,10 +543,9 @@ bool Qwen3_TK::insert(chat_meta_info_t& meta_info, lm_uniform_input_t& input, st
 
     // hardware
     int restore_idx = -1;
-    qwen3_npu *qwen3_engine = dynamic_cast<qwen3_npu*>(this->lm_engine.get());
 
     if (meta_info.restore_allowed) {
-        restore_idx = qwen3_engine->restore();
+        restore_idx = this->lm_engine->restore();
         this->total_tokens = restore_idx;
         this->token_history = checkpoint_his; // restore the token history to be consistent with the restored KV cache, which is crucial for correct functioning of _shared_insert's prefix-matching logic
     }
@@ -538,7 +556,7 @@ bool Qwen3_TK::insert(chat_meta_info_t& meta_info, lm_uniform_input_t& input, st
     bool success = this->_shared_insert(meta_info, tokens, is_cancelled, nullptr);
 
     checkpoint_his = token_history;
-    int checkpoint_idx = qwen3_engine->checkpoint();
+    int checkpoint_idx = this->lm_engine->checkpoint();
 
     return success;
 }
@@ -746,16 +764,15 @@ bool DeepSeek_r1_0528_8b::insert(chat_meta_info_t& meta_info, lm_uniform_input_t
 
     // hardware
     int restore_idx = -1;
-    qwen3_npu *qwen3_engine = dynamic_cast<qwen3_npu*>(this->lm_engine.get());
     if (meta_info.restore_allowed) {
-        restore_idx = qwen3_engine->restore();
+        restore_idx = this->lm_engine->restore();
         this->total_tokens = restore_idx;
         this->token_history = checkpoint_his; // restore the token history to be consistent with the restored KV cache, which is crucial for correct functioning of _shared_insert's prefix-matching logic
     }
     bool success = this->_shared_insert(meta_info, tokens, is_cancelled, nullptr);
 
     checkpoint_his = token_history;
-    int checkpoint_idx = qwen3_engine->checkpoint();
+    int checkpoint_idx = this->lm_engine->checkpoint();
 
     return success;
 }
