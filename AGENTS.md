@@ -25,6 +25,23 @@ Note: Peano (llvm-aie) has not been added to PATH to avoid conflict with
 
 Activate the ironvenv/bin/activate; use source utilities/mlir-aie/utils/env_setup.sh also *if needed*
 
+## Building xclbins
+
+The xclbins are built, not checked in. There is ONE command for every design set
+in the repository, and one document describing the convention:
+
+    python tools/build_designs.py doctor   # can this shell build at all?
+    python tools/build_designs.py list     # what exists, and is it built?
+    python tools/build_designs.py build    # build what is missing
+    python tools/build_designs.py check    # do the built sets match their spec?
+
+Read `docs/design-sets.md` before adding a third producer. The short version:
+`ironvenv-requirements.txt` is the only toolchain pin, `tools/npu_designs.py`
+holds everything two producers must agree about (the `toolchain.json` schema,
+the shared `~/.npu/cache` lock, the device pin, the xclbin comparison), and each
+producer's flags stay in its own spec — `npu_offload/gemm_rtp/families.json` and
+`open_kernels/export_qwen36_kernels.py`'s `SETS`. Nothing restates them.
+
 <available_skills>
   <skill>
     <name>npu_offload_pipeline</name>

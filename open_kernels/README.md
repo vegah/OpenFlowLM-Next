@@ -5,6 +5,14 @@
 > (`fixture_paths.py`). For building and running the designs from THIS tree use
 > `harness/README.md` (`run_kernel`, synthetic fixtures, 1.4.2 pin); for the six
 > kernel sets the engine loads, `export_qwen36_kernels.py` (`src/open_qwen36/README.md`).
+>
+> **The six sets build from the repository's one entry command** —
+> `python tools/build_designs.py build --producer open_kernels` — which holds a
+> single `~/.npu/cache` lock across this producer and `npu_offload/gemm_rtp/`,
+> because both build through that cache and its entries are purged by content.
+> `export_qwen36_kernels.py` still works directly and takes the same lock. The
+> `toolchain.json` schema, the device pin and the xclbin comparison are shared:
+> `tools/npu_designs.py`, described in [`../docs/design-sets.md`](../docs/design-sets.md).
 
 # open-kernels — our own NPU kernels (IRON / mlir-aie), driven by phlegm
 

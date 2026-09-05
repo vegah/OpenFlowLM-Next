@@ -16,10 +16,13 @@ it.
 | `gemm_pretiled.py` | the IRON design: the whole-array pre-tiled GEMM, its ObjectFifo dataflow and the `mm.cc` kernel invocation |
 | `export_gemm_rtp.py` | the driver — builds every (shape, tier) stream against one xclbin and writes the design set |
 | `npue.py` | the container format, for `gemm_b_layout()` / `layout_hash()` and the B-tiling the packer must match |
-| `toolchain_provenance.py` | writes `toolchain.json` beside the design |
+| `toolchain_provenance.py` | writes `toolchain.json` beside the design — a shim over `tools/npu_designs.py`, so both producers write one schema |
 | `families.json` | the five design families and their flags — the ONLY place those are written down |
-| `build.ps1` | builds all five in order, skipping what is already built, then checks them |
+| `build.ps1` | wrapper over `python tools/build_designs.py build --producer gemm_rtp` |
 | `check_design_sets.py` | checks the built sets against `families.json` |
+
+The build itself is one command for the whole repository —
+`tools/build_designs.py`, see [`docs/design-sets.md`](../../docs/design-sets.md).
 
 And **three AIE kernel sources**, one directory over, at
 `npu_offload/m5-eltwise/kernels/` — the path `gemm_pretiled.py` computes for
@@ -72,15 +75,23 @@ Two traps that cost an hour each if you meet them cold:
 
 ```powershell
 cd C:\dev\mlir-aie; . .\iron_env.ps1        # MUST be dot-sourced
-cd <repo>; .\npu_offload\gemm_rtp\build.ps1
+cd <repo>; python tools\build_designs.py doctor      # is this shell able to build?
+cd <repo>; python tools\build_designs.py build --producer gemm_rtp
 ```
 
+`.\npu_offload\gemm_rtp\build.ps1` is the same thing and now wraps it.
+
 That is the whole thing. Five families in order, ~20 minutes, skipping any that
-are already built. `-Force` rebuilds, `-Only <name>` does one, `-Dst <dir>`
-builds elsewhere. It checks the IRON toolchain is on the path *before* spending
-four minutes discovering it is not, and it ends by running
-`check_design_sets.py`, so a green run means the sets exist **and** match the
-flags they were supposed to be built with.
+are already built. `--force` rebuilds, `--only <name>` does one, `--xclbins
+<dir>` builds elsewhere. `doctor` checks the IRON toolchain, the pinned
+versions, `XILINX_XRT` and the build cache *before* spending four minutes
+discovering one of them is wrong, and the build ends by running the check — so
+a green run means the sets exist **and** match the flags they were supposed to
+be built with.
+
+The one command covers the Qwen sets in `open_kernels/` too, and holds a single
+`~/.npu/cache` lock across both, because they build through the same cache.
+→ [`docs/design-sets.md`](../../docs/design-sets.md)
 
 **There are deliberately no commands to copy in this file.** Every one of the
 three ways to get them wrong has now cost somebody a session:
@@ -91,8 +102,12 @@ three ways to get them wrong has now cost somebody a session:
 | `--out $dst\BERT-...` | PowerShell does **not** error on an undefined variable, it expands it to nothing — so this became `--out \BERT-...` and built to the **drive root**. Successfully. Four times. |
 | two families at once | `purge()` deletes matching entries from the shared `~/.npu/cache` on content markers, and `qkv`/`attn_out` depend on neither `--gated-ffn` nor `--intermediate`, so the two hidden-768 families own identical markers for 8 of their 16 entries and each deletes the other's builds |
 
-The third now refuses in under a second (`export_gemm_rtp.py` holds a lock);
-the first two are gone because the commands are.
+The third now refuses in under a second — `tools/build_designs.py` holds one
+`~/.npu/cache` lock across **both** producers in this repository, which matters
+because `open_kernels/` builds through the same cache. Note the boundary:
+`export_gemm_rtp.py` is a dumb copy synced from upstream and is not patched
+here, so invoking it **directly** in this tree is unguarded. Go through the
+entry command. The first two rows are gone because the commands are.
 
 ## The families, and what makes each one different
 

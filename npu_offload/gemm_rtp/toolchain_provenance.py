@@ -1,80 +1,48 @@
-# NpuEmbeddings -- toolchain provenance sidecar (T39, tasks/0106).
 # SPDX-License-Identifier: MIT
+# Toolchain provenance sidecar for the gemm_rtp design sets.
 #
-# tasks/0102's audit found that kernel config hash `333c4d33` names TWO
-# different instruction streams -- 0 `crrnd` instructions before the mlir-aie
-# 1.3.4 -> 1.4.2 upgrade, 3 after -- and nothing in the build path could tell
-# them apart; the audit had to fall back on .xclbin MTIME, in a repo whose
-# trap 7c forbids exactly that, because no better source existed
-# (research/notes/0009-toolchain-provenance.md).
+# THE IMPLEMENTATION MOVED to tools/npu_designs.py. It used to live here, and
+# open_kernels/export_qwen36_kernels.py grew its own copy that wrote the same
+# FILENAME with a different SCHEMA -- three fields here, eight there, both
+# called toolchain.json, both landing under src/xclbins/. src/open_npue/
+# npu_device.cpp reads the file and reports "unavailable" for any field it does
+# not find, so the disagreement degrades silently instead of failing. One
+# schema, written by one function, is the fix; this file stays as the name
+# export_gemm_rtp.py imports.
 #
-# This writes a small toolchain.json NEXT TO each design.json the export
-# tools already emit, capturing three strings that are already resident or a
-# cheap call away: the mlir_aie package version, the Peano (llvm-aie) package
-# version, and `git rev-parse HEAD` of C:\dev\mlir-aie. Nothing here is
+# What it records: the mlir_aie and Peano (llvm-aie) package versions, the git
+# HEAD of the mlir-aie checkout and of this repository. Nothing here is
 # interpreted by the runtime -- it only reports it.
 #
-# DELIBERATE DEPARTURE from note 0009's proposal: the note also suggested
-# tools/pack_npue.py copy a design's toolchain.json into the .npue container
-# header. That is NOT done here. A .npue is packed from HuggingFace weights
-# and never invokes mlir-aie at all, so a design's toolchain is not a
-# property of the container -- the relationship between designs and
-# containers is many-to-many in both directions (tasks/0104 gave MiniLM and
-# bge-small different designs at the same geometry). Baking a design's build
-# string into a container would assert a 1:1 relationship that does not
-# exist, the same mistake the datapath field would have been if it had been
-# put in the container instead of design.json. toolchain.json lives ONLY next
-# to design.json, in the artifacts directory.
-#
-# Never fails a build: an export must not die because provenance couldn't be
-# established. A field that can't be read is recorded as "unavailable", never
+# Never fails a build: an export must not die because provenance could not be
+# established. A field that cannot be read is recorded as "unavailable", never
 # guessed at and never a raised exception.
+#
+# DELIBERATE DEPARTURE from the original proposal: the packer does NOT copy a
+# design's toolchain.json into the .npue container header. A container is packed
+# from HuggingFace weights and never invokes mlir-aie, so a design's toolchain
+# is not a property of the container -- the relationship between designs and
+# containers is many-to-many in both directions. toolchain.json lives ONLY next
+# to design.json, in the artifacts directory.
 
 from __future__ import annotations
 
-import json
-import subprocess
+import sys
 from pathlib import Path
 
-MLIR_AIE_ROOT = Path(r"C:\dev\mlir-aie")
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
+from npu_designs import mlir_aie_root, write_toolchain_json as _write  # noqa: E402
+
+MLIR_AIE_ROOT = mlir_aie_root()
 
 
-def _pkg_version(name: str) -> str:
-    try:
-        import importlib.metadata as m
-        return m.version(name)
-    except Exception:
-        return "unavailable"
-
-
-def _git_head(root: Path) -> str:
-    try:
-        out = subprocess.run(
-            ["git", "-C", str(root), "rev-parse", "HEAD"],
-            capture_output=True, text=True, timeout=10)
-        if out.returncode != 0:
-            return "unavailable"
-        head = out.stdout.strip()
-        return head if head else "unavailable"
-    except Exception:
-        return "unavailable"
-
-
-def write_toolchain_json(out_dir: Path,
-                         mlir_aie_root: Path = MLIR_AIE_ROOT) -> dict:
+def write_toolchain_json(out_dir, mlir_aie_root=None) -> dict:
     """Write toolchain.json next to design.json in `out_dir`.
 
-    Three strings, all best-effort: a failure to read any one of them
-    degrades that field to "unavailable" rather than raising, because
-    provenance is not worth failing an export over.
+    `mlir_aie_root` is accepted for compatibility and ignored: the shared module
+    resolves the checkout the same way for every producer, so a build no longer
+    depends on which of three documented locations the caller happened to know
+    about (C:\\dev\\mlir-aie here, ~/ironenv142 in open_kernels, ironvenv +
+    utilities/mlir-aie in AGENTS.md).
     """
-    info = {
-        "mlir_aie_version": _pkg_version("mlir_aie"),
-        "peano_version": _pkg_version("llvm-aie"),
-        "mlir_aie_git_head": _git_head(mlir_aie_root),
-    }
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "toolchain.json").write_text(json.dumps(info, indent=2),
-                                            encoding="utf-8")
-    return info
+    return _write(Path(out_dir), producer="gemm_rtp")

@@ -20,8 +20,8 @@ import sys
 import time
 from pathlib import Path
 
-import aie.iron as iron
-from aie.iron.device import from_name
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+from npu_designs import set_current_device  # noqa: E402
 
 
 def main() -> int:
@@ -33,8 +33,9 @@ def main() -> int:
     shutil.rmtree(out / "final.prj", ignore_errors=True)
     out.mkdir(parents=True, exist_ok=True)
 
-    # Trap 1 (LLMNpuTest): without this IRON silently targets aie2 / NPU1.
-    iron.set_current_device(from_name("npu2", n_cols=None))
+    # Without this IRON silently targets aie2 / NPU1 -- see tools/npu_designs.py
+    # for what that costs and why it is invisible.
+    set_current_device()
 
     spec = importlib.util.spec_from_file_location(src.stem, src)
     mod = importlib.util.module_from_spec(spec)
