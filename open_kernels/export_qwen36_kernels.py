@@ -40,8 +40,10 @@ DESIGNS = HERE / "designs"
 DEFAULT_OUT = REPO / "src" / "xclbins" / "Qwen3.6-35B-A3B-NPU2" / "open_kernels"
 
 # The build-side facts this producer shares with npu_offload/gemm_rtp/: the
-# toolchain.json schema, the ~/.npu/cache lock (both producers build through
-# that cache, and its entries are purged by content), and the xclbin comparison
+# toolchain.json schema, the build lock (this producer does NOT use the IRON
+# cache -- explicit output paths bypass it, measured at zero entries for six
+# sets -- but SETS below names fixed build directories in the working tree,
+# which collide just as surely), and the xclbin comparison
 # that used to live in this file. That comparison moved because "did this source
 # really produce these bytes?" is the only honest test of a repository that
 # ships source instead of binaries, and BOTH producers make that claim.
@@ -49,7 +51,7 @@ DEFAULT_OUT = REPO / "src" / "xclbins" / "Qwen3.6-35B-A3B-NPU2" / "open_kernels"
 # compile-time knobs are written down.
 sys.path.insert(0, str(REPO / "tools"))
 from npu_designs import (  # noqa: E402
-    CacheLock, artifacts_equivalent, sha256_file, write_toolchain_json,
+    BuildLock, artifacts_equivalent, sha256_file, write_toolchain_json,
 )
 
 # name -> (design source, build dir, compile-time environment)
@@ -103,10 +105,12 @@ def main() -> int:
 
     out_root = Path(a.out).resolve()
     hashes: dict[str, str] = {}
-    # One build at a time through the shared IRON cache. --no-build only copies
-    # and hashes what is already there, so it needs no lock and must not take
-    # one -- it is the operation you run while a build is going.
-    with CacheLock(a.force_unlock, what="export_qwen36_kernels.py") if not a.no_build \
+    # One build at a time: SETS names fixed build directories in the working
+    # tree, so a second build of the same set overwrites this one's whatever
+    # --out says. --no-build only copies and hashes what is already there, so it
+    # needs no lock and must not take one -- it is the operation you run WHILE a
+    # build is going.
+    with BuildLock(a.force_unlock, what="export_qwen36_kernels.py") if not a.no_build \
             else contextlib.nullcontext():
         for n in names:
             bdir = SETS[n][1] if a.no_build else build(n)

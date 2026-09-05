@@ -90,8 +90,8 @@ a green run means the sets exist **and** match the flags they were supposed to
 be built with.
 
 The one command covers the Qwen sets in `open_kernels/` too, and holds a single
-`~/.npu/cache` lock across both, because they build through the same cache.
-→ [`docs/design-sets.md`](../../docs/design-sets.md)
+build lock across both — for two different collisions, only one of which is
+this cache. → [`docs/design-sets.md`](../../docs/design-sets.md)
 
 **There are deliberately no commands to copy in this file.** Every one of the
 three ways to get them wrong has now cost somebody a session:
@@ -103,8 +103,10 @@ three ways to get them wrong has now cost somebody a session:
 | two families at once | `purge()` deletes matching entries from the shared `~/.npu/cache` on content markers, and `qkv`/`attn_out` depend on neither `--gated-ffn` nor `--intermediate`, so the two hidden-768 families own identical markers for 8 of their 16 entries and each deletes the other's builds |
 
 The third now refuses in under a second — `tools/build_designs.py` holds one
-`~/.npu/cache` lock across **both** producers in this repository, which matters
-because `open_kernels/` builds through the same cache. Note the boundary:
+build lock across **both** producers in this repository. Note that
+`open_kernels/` does *not* share this cache (it compiles with explicit output
+paths, which bypass it); it collides in its own fixed build directories
+instead, and one lock covers both. Note the boundary too:
 `export_gemm_rtp.py` is a dumb copy synced from upstream and is not patched
 here, so invoking it **directly** in this tree is unguarded. Go through the
 entry command. The first two rows are gone because the commands are.

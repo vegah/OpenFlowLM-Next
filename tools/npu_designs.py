@@ -18,12 +18,22 @@ drifted apart by the time this file was written:
     mlir_aie_git_head); open_kernels writes eight. src/open_npue/npu_device.cpp
     reads the file and reports "unavailable" for anything missing, so a set
     built by the wrong producer degrades silently rather than failing.
-  * The IRON build cache (~/.npu/cache) is GLOBAL and gemm_rtp's purge() deletes
-    entries by content markers. npu_offload/gemm_rtp/build.ps1 states in its own
-    header that "export_gemm_rtp.py holds a lock now and refuses in under a
-    second" -- and in this tree it does not: the lock was added upstream after
-    the copy was taken. Two producers now share that cache, so the guard matters
-    more than it did when it went missing.
+  * Concurrent builds destroy each other, and npu_offload/gemm_rtp/build.ps1
+    stated in its own header that a guard existed ("export_gemm_rtp.py holds a
+    lock now and refuses in under a second") which this tree does not have --
+    the lock was added upstream after the copy was taken. The two producers get
+    there by DIFFERENT routes, which is worth knowing before trusting one lock
+    to cover both:
+      - gemm_rtp collides in the IRON build cache: ~/.npu/cache is global and
+        purge() deletes entries by CONTENT markers, so two families that share
+        a shape delete each other's freshly built entries.
+      - open_kernels does NOT touch that cache at all. Measured: six sets, 42
+        minutes, ZERO entries left in ~/.npu/cache, against 125 from one
+        gemm_rtp run -- because build_design.py compiles with explicit output
+        paths, and explicit paths bypass the JIT cache. It collides somewhere
+        else: SETS names FIXED build directories inside the repo
+        (designs/layer_x/build_lx0 and friends), so two builds of the same set
+        overwrite each other's working tree whatever --out says.
   * mlir-aie is looked for in three places by three files: C:\dev\mlir-aie
     (toolchain_provenance.py), ~/ironenv142 (open_kernels), ironvenv +
     utilities/mlir-aie (AGENTS.md). A from-scratch build follows whichever
@@ -119,6 +129,24 @@ def required_pins() -> dict:
     return pins
 
 
+def find_aiebu_asm():
+    """Where aiecc looks for aiebu-asm, asked the same way aiecc asks.
+
+    Read out of the aiecc binary's own strings rather than guessed: PATH, then
+    /opt/xilinx/xrt/bin, /usr/bin, /opt/xilinx/aiebu/bin. Checking only PATH
+    would report "missing" on a machine where aiecc is perfectly happy, and a
+    build tool that disagrees with the compiler about what is installed is
+    worse than no check."""
+    p = shutil.which("aiebu-asm")
+    if p:
+        return Path(p)
+    for d in ("/opt/xilinx/xrt/bin", "/usr/bin", "/opt/xilinx/aiebu/bin"):
+        c = Path(d) / "aiebu-asm"
+        if c.is_file():
+            return c
+    return None
+
+
 def set_current_device() -> None:
     """Pin IRON to npu2 BEFORE any kernel is created.
 
@@ -136,20 +164,29 @@ def set_current_device() -> None:
 # the shared build cache, and the lock that keeps two producers out of it
 # --------------------------------------------------------------------------
 
-class CacheLock:
-    """Refuse to start while another export owns ~/.npu/cache.
+class BuildLock:
+    """Refuse to start while another NPU design build is running.
 
-    gemm_rtp's purge() rmtree's every cache entry whose markers match, and the
-    markers are CONTENT -- M*K, K*N, M*N, the dtypes. Two builds can therefore
-    own the same marker set, and they do: qkv and attn_out depend on neither
-    --gated-ffn nor --intermediate, so BERT-h768-bfp16 and BERT-h768-gated-bfp16
-    share 8 of their 16 entries exactly. Running them together is not a race
-    that needs bad luck; it is a guaranteed collision, and it surfaces minutes
-    later as a FileNotFoundError on a cache hash that names nothing.
+    ONE lock, TWO different collisions -- do not simplify this to "the cache":
 
-    It is in the shared module rather than in one producer because open_kernels
-    builds through the same cache. A lock only export_gemm_rtp.py takes does not
-    protect a gemm_rtp build from a concurrent Qwen build.
+      - gemm_rtp: purge() rmtree's every ~/.npu/cache entry whose markers match,
+        and the markers are CONTENT -- M*K, K*N, M*N, the dtypes. qkv and
+        attn_out depend on neither --gated-ffn nor --intermediate, so
+        BERT-h768-bfp16 and BERT-h768-gated-bfp16 share 8 of their 16 entries
+        exactly. Not a race that needs bad luck; a guaranteed collision, landing
+        minutes later as a FileNotFoundError on a cache hash that names nothing.
+      - open_kernels: never touches that cache (explicit output paths bypass the
+        JIT cache -- measured, six sets and zero entries). It collides in the
+        FIXED build directories under open_kernels/designs/, which are part of
+        the working tree and are the same paths whatever --out says.
+
+    The lock DIRECTORY is nonetheless kept inside ~/.npu/cache, and that is
+    deliberate: it is the path upstream NpuEmbeddings' own export_gemm_rtp.py
+    locks. When a future sync brings that copy in, the two meet on the same
+    file rather than each guarding a different door.
+
+    A lock only export_gemm_rtp.py takes does not protect a gemm_rtp build from
+    a concurrent Qwen build, which is why it lives here and not in a producer.
 
     It is re-entrant ACROSS PROCESSES through NPU_DESIGN_BUILD_LOCK, which
     build_designs.py sets for its children. Without that, the one entry command

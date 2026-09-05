@@ -16,14 +16,16 @@ export_qwen36_kernels.py (WSL venv, six Qwen sets), with three different
 documented toolchain locations between them and AGENTS.md.
 
 This does not replace either producer and does not restate a single one of
-their flags. It finds them, runs them, holds one lock across both (they share
-~/.npu/cache, and entries there are purged by content), and checks what came
-out. `build.ps1` still works and now calls through here.
+their flags. It finds them, runs them, holds one lock across both, and checks
+what came out. `build.ps1` still works and now calls through here.
 
 WHAT IT CANNOT DO. Building needs the IRON toolchain on the current
-interpreter -- `doctor` says so plainly rather than failing four minutes in.
-The Qwen sets additionally need xclbinutil/aiebu-asm on PATH, which is why they
-are normally built in WSL.
+interpreter, and an `xclbinutil` -- `doctor` says so plainly rather than
+failing four minutes in. Nothing here is OS-specific: an xclbin is a device
+artifact (AIE core ELFs, CDOs, a PDI) with no host code in it, and the five
+BERT families were built on Windows and the six Qwen sets in WSL against this
+same file. `insts.elf` is the one output that needs a tool (`aiebu-asm`) which
+is not obtainable without root; it is skipped, loudly, when absent.
 """
 from __future__ import annotations
 
@@ -38,6 +40,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import npu_designs as nd  # noqa: E402
+from npu_designs import find_aiebu_asm  # noqa: E402
 
 GEMM_RTP = nd.REPO / "npu_offload" / "gemm_rtp"
 OPEN_KERNELS = nd.REPO / "open_kernels"
@@ -115,17 +118,28 @@ def cmd_doctor(args) -> int:
                                  "Use XRT_ROOT.".format(os.environ["XILINX_XRT"]))
     else:
         ok("XILINX_XRT unset")
-    for tool in ("xclbinutil", "aiebu-asm"):
-        p = shutil.which(tool)
-        (ok if p else note)(tool, p or "not on PATH (needed for the Qwen sets)")
+    p = shutil.which("xclbinutil")
+    (ok if p else fail)(
+        "xclbinutil", p or "not on PATH -- aiecc cannot package an xclbin. "
+                           "Build mlir-aie's own\n           "
+                           "third_party/hrx-xclbinutil (self-contained: no "
+                           "Boost, no system XRT)\n           and symlink it "
+                           "onto PATH as `xclbinutil`.")
+    p = find_aiebu_asm()
+    (ok if p else note)(
+        "aiebu-asm", str(p) if p else
+        "not found -- builds proceed WITHOUT insts.elf.\n           "
+        "final.xclbin and insts.bin are unaffected, so the Qwen sets and the\n"
+        "           engine are fine; the C++ harness (xrt::elf) is not. Needs "
+        "XRT, or\n           Xilinx/aiebu (Boost + liblzma + liblz4, i.e. root).")
 
-    print("\nbuild cache")
-    owner = nd.CacheLock.owner()
+    print("\nbuild lock")
+    owner = nd.BuildLock.owner()
     if owner:
-        note("~/.npu/cache free", "locked by {} -- another build is running, or "
-                                  "the lock is stale".format(owner))
+        note("no build running", "locked by {} -- another build is running, or "
+                                 "the lock is stale (--force-unlock)".format(owner))
     else:
-        ok("~/.npu/cache free", str(nd.CACHE))
+        ok("no build running", str(nd.CACHE / ".export.lock") + " is free")
 
     print("\n{} problem(s), {} warning(s)".format(bad, warn))
     return 1 if bad else 0
@@ -240,10 +254,11 @@ def cmd_build(args) -> int:
     print("Building into {}".format(out_root))
     failed = []
     t0 = time.time()
-    # ONE lock across both producers: they share ~/.npu/cache, where entries are
-    # purged by content markers, so a Qwen build and a BERT build running
-    # together delete each other's work exactly as two BERT builds would.
-    with nd.CacheLock(force=args.force_unlock, what="build_designs.py"):
+    # ONE lock across both producers, for two DIFFERENT collisions: gemm_rtp
+    # shares ~/.npu/cache, whose entries are purged by content markers, while
+    # open_kernels bypasses that cache entirely and instead writes fixed build
+    # directories inside the working tree. See tools/npu_designs.py.
+    with nd.BuildLock(force=args.force_unlock, what="build_designs.py"):
         # Set only AFTER the lock is held: a producer this script invokes sees
         # the variable and inherits the lock instead of deadlocking on it.
         os.environ["NPU_DESIGN_BUILD_LOCK"] = str(os.getpid())

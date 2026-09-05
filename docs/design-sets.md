@@ -77,20 +77,77 @@ The mlir-aie checkout is resolved in one place, in this order:
 files used to hardcode three different answers, and a from-scratch build
 followed whichever document its reader found first.
 
-## The shared build cache, and why builds are serialised
+### From scratch in WSL, with no root
 
-IRON's build cache is **global** (`~/.npu/cache`) and `gemm_rtp`'s `purge()`
-deletes entries by **content markers** — `M*K`, `K*N`, `M*N`, the dtypes. Two
-builds can therefore own the same markers, and they do: `qkv` and `attn_out`
+Verified on a clean Ubuntu 24.04 that had only an old mlir-aie 1.3.4 venv —
+which `doctor` correctly refused, because 1.3.4's runtime API cannot build the
+current designs at all (`rt.task_group()` vs `TaskGroup()`, `rt.fill(fifo, …)`
+vs `fifo.fill(…)`).
+
+```bash
+python3 -m venv ~/ironenv142
+~/ironenv142/bin/pip install -r ironvenv-requirements.txt      # mlir-aie 1.4.2 + Peano
+
+# xclbinutil: mlir-aie ships the source, deliberately self-contained
+cmake -B ~/hrx-build -S ~/mlir-aie/third_party/hrx-xclbinutil -DCMAKE_BUILD_TYPE=Release
+cmake --build ~/hrx-build --target hrx-xclbinutil -j$(nproc)
+mkdir -p ~/xrt-tools/bin
+ln -sf ~/hrx-build/tools/hrx-xclbinutil ~/xrt-tools/bin/xclbinutil
+
+export PATH=~/xrt-tools/bin:$PATH
+source ~/ironenv142/bin/activate
+python tools/build_designs.py doctor
+python tools/build_designs.py build --producer open_kernels
+```
+
+`pip`, `cmake`, `g++`. **No XRT install, no Boost, no `sudo`.**
+
+### `aiebu-asm` and `insts.elf`
+
+The one tool that will *not* come from a checkout is `aiebu-asm`: Xilinx/aiebu
+needs Boost, liblzma and liblz4, i.e. a package manager and an administrator.
+It is used by exactly one aiecc step — the last one, emitting `insts.elf` — and
+before this was made conditional, its absence failed the **whole** pipeline
+after the AIE compile and `insts.bin` were already finished.
+
+That step is not on the path to a shipped kernel. `export_qwen36_kernels.py`
+copies `final.xclbin` and `insts.bin`, and nothing else; the ELF is for the C++
+harness (`xrt::elf(insts.elf)`), a different workflow. So `build_design.py`
+skips it when the tool is missing and **says so loudly**, `doctor` reports it as
+a warning naming exactly what is degraded, and a stale `insts.elf` is deleted
+rather than left to look current.
+
+`xclbinutil`, by contrast, is a hard requirement — `doctor` reports its absence
+as a problem, not a warning, because aiecc cannot package an xclbin without it.
+
+## Why builds are serialised — one lock, two different collisions
+
+Do not simplify this to "the shared cache". The two producers destroy a
+concurrent build by different mechanisms, and only one of them involves the
+cache at all.
+
+**`gemm_rtp` collides in the IRON build cache.** It is global (`~/.npu/cache`)
+and `purge()` deletes entries by **content markers** — `M*K`, `K*N`, `M*N`, the
+dtypes. Two builds can own the same markers, and they do: `qkv` and `attn_out`
 depend on neither `--gated-ffn` nor `--intermediate`, so `BERT-h768-bfp16` and
-`BERT-h768-gated-bfp16` share 8 of their 16 entries exactly. Running them
-together is not a race that needs bad luck; it is a guaranteed collision, and
-it surfaces minutes later as a `FileNotFoundError` on a cache hash that names
-nothing.
+`BERT-h768-gated-bfp16` share 8 of their 16 entries exactly. Not a race that
+needs bad luck — a guaranteed collision, surfacing minutes later as a
+`FileNotFoundError` on a cache hash that names nothing.
 
-`build_designs.py` holds one lock across **both** producers for exactly this
-reason — `open_kernels` builds through the same cache. If a build crashes and
-leaves the lock behind, `--force-unlock` clears it.
+**`open_kernels` never touches that cache.** Measured: six sets, 42 minutes,
+**zero** entries left in `~/.npu/cache`, against 125 from a single `gemm_rtp`
+run — `build_design.py` compiles with explicit output paths, and explicit paths
+bypass the JIT cache. It collides somewhere else entirely: `SETS` names **fixed
+build directories inside the working tree** (`designs/layer_x/build_lx0` and
+friends), which are the same paths whatever `--out` says. That also means a
+Windows build and a WSL build of the same set collide even though they have
+different `$HOME`s and therefore different locks.
+
+`build_designs.py` holds one lock across both producers for both reasons. The
+lock directory stays inside `~/.npu/cache` anyway, deliberately: that is the
+path upstream NpuEmbeddings' own `export_gemm_rtp.py` locks, so when a future
+sync brings that copy in, the two meet on the same file instead of each
+guarding a different door. `--force-unlock` clears a lock left by a crash.
 
 > **One gap, stated rather than hidden.** `npu_offload/gemm_rtp/` is a *dumb
 > copy* synced from the upstream NpuEmbeddings repository, so it is not patched
