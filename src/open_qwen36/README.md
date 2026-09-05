@@ -8,11 +8,13 @@ same way they drive the closed DLL. Below the seam it is:
 | file | what |
 |---|---|
 | [q4nx_file.cpp](q4nx_file.cpp) | reads FLM's `.q4nx` container (mmap; the 1.0.2 q4_1 format, refuses others) — replaces `q4_npu_eXpress.dll` on this path |
-| [pools.cpp](pools.cpp) | packs each layer's weights into the byte order the kernels stream, straight into resident device buffers; byte-identical to `open_kernels/model/pools.py` |
-| [core.cpp](core.cpp) | device, contexts, kernels, 21 GB of resident pools, per-layer state; one `step()` per token |
+| [manifest.cpp](manifest.cpp) | reads the kernel set's `manifest.json`: layouts, contexts, kernels, per-layer programs, the packing plan, and the model check |
+| [pools.cpp](pools.cpp) | interprets the manifest's packing plan: each layer's weights into the byte order the kernels stream, straight into resident device buffers (the same plan `open_kernels/recipes/pack.py` runs in NumPy) |
+| [core.cpp](core.cpp) | device, contexts, kernels, 21 GB of resident pools, per-layer state; runs the manifest's program per layer, one `step()` per token |
 | [engine.cpp](engine.cpp) | the `causal_lm` adapter: forward / prefill / checkpoint / restore / KV accessors |
 | [cli.cpp](cli.cpp), [chat.py](chat.py) | drive the engine without the app (ids in, tokens out; `chat.py` tokenizes) |
-| `../xclbins/<model>/open_kernels/` | the six kernels (`lx0 lx1 ax0 ax1 ln lm_head_q8`), **built, not checked in** — see below |
+| [manifest_test.cpp](manifest_test.cpp) | the OPEN-MANIFEST unit test (no XRT): parses the checked-in fixture, checks the model refusals |
+| `../xclbins/<model>/open_kernels/` | `manifest.json` + the six kernels (`lx0 lx1 ax0 ax1 ln lm_head_q8`), **built, not checked in** — see below |
 
 The kernels are `open_kernels/designs/layer_x` (+ `ln`, `lm_head_q8`): one xclbin
 context per layer type, two dispatches per layer (everything up to the router;
@@ -21,19 +23,41 @@ router's top-8), plus the final norm and the q8 lm_head. Per-token instruction
 patching (`open_kernels/harness/stream_patch.hpp`) is what lets one compiled
 program serve every layer and every position.
 
+**No model constant lives in the C++.** The engine is an interpreter of
+`manifest.json`, which `open_kernels/recipes/` writes from the model's
+`ModelSpec` (hidden size, heads, experts, ... from `config.json`): the
+consts / act / state / pool offsets, the KV row, which xclbin serves which
+layer type, the verb sequence per layer (`run lx0` → `moeroute2 lx1` →
+`run lx1`; `run ax0` → `moeroute2 ax1` → `run ax1`; then `ln`, `lm`), and the
+tensor → pool-offset → chunk-order plan the packer follows. The same recipe
+parametrizes the IRON designs, so the numbers in the instruction streams and
+the numbers the driver uses have one source. A model whose `config.json`
+disagrees with the manifest is refused at startup with the key named
+(`specs/open-engine/spec.md`, OPEN-MANIFEST).
+
 ## Building the kernels
 
 The compiled kernels are not in the repository (`.gitignore`), the same rule
-as the BERT design sets: the source is `open_kernels/designs/`, and one
-command produces the six `final.xclbin` + `insts.bin` pairs the engine loads,
-in the directory it loads them from:
+as the BERT design sets: the source is `open_kernels/designs/` plus the recipe
+in `open_kernels/recipes/`, and one command produces the six `final.xclbin` +
+`insts.bin` pairs the engine loads and the `manifest.json` it reads, in the
+directory it loads them from:
 
 ```
 source ~/ironenv142/bin/activate            # mlir-aie 1.4.2 + Peano (ironvenv-requirements.txt)
 export PATH=~/xrt-tools/bin:$PATH           # xclbinutil, aiebu-asm (from an XRT build)
-python open_kernels/export_qwen36_kernels.py
-#   -> src/xclbins/Qwen3.6-35B-A3B-NPU2/open_kernels/{lx0,lx1,ax0,ax1,ln,lm_head_q8}/ + toolchain.json
+python open_kernels/export_qwen36_kernels.py [--model-dir ~/.flm/models/Qwen3.6-35B-A3B-NPU2]
+#   -> src/xclbins/Qwen3.6-35B-A3B-NPU2/open_kernels/{lx0,lx1,ax0,ax1,ln,lm_head_q8}/
+#      + manifest.json + spec.json + toolchain.json
 ```
+
+`--model-dir` derives the spec from that model's `config.json` (default: the
+checked-in `recipes/specs/qwen36-35b-a3b.json`, the same model). The
+manifest's `build_key` hashes the recipe, every kernel source the designs
+include, the spec and the quant format; an export whose manifest already
+carries the key is skipped (`--force` rebuilds). A shipped kernel directory
+without a manifest needs one before the engine will take it:
+`cd open_kernels && python -m recipes.manifest --model-dir <model> --out <kernel dir>/manifest.json`.
 
 | set | design | knobs | what it is |
 |---|---|---|---|
@@ -46,7 +70,8 @@ python open_kernels/export_qwen36_kernels.py
 
 About 6 minutes for all six on a Ryzen AI 9 HX 370 (WSL; ~90 s per layer_x set). `--only lx0,lx1`
 rebuilds a subset, `--out DIR` redirects (a model directory's `open_kernels/`
-and `FLM_OPEN_KERNELS_DIR` are the engine's other two lookup locations).
+and `FLM_OPEN_KERNELS_DIR` are the engine's other two lookup locations; each
+must hold a `manifest.json` naming files that exist).
 `toolchain.json` records the mlir-aie and Peano versions, this tree's commit,
 and every file's sha256. The distributed package ships the built kernels; a
 source checkout builds them. In WSL the kernels are built and on Windows they
@@ -64,7 +89,11 @@ originally shipped, built 2026-09-04 on the same toolchain:
 Every CDO and every AIE core ELF matched; `--check` masks exactly those stamp
 fields (parsing the axlf and partition structs, not by offset guesswork) and
 fails on any other byte. A rebuilt `ln` was also run on the NPU through the
-harness: `y maxrel 5.4e-8`, `xn` bit-exact, same as the shipped one.
+harness: `y maxrel 5.4e-8`, `xn` bit-exact, same as the shipped one. The same
+check passed again on 2026-09-05 after the designs were rewritten to take
+every dimension from the recipe (all six streams byte-identical), and the
+8-layer decode through the manifest interpreter scored the same
+0.999998 / 0.999996 / 0.999991 logits correlation as before.
 
 ## Selecting it
 
