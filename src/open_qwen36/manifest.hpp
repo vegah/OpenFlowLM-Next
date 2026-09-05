@@ -66,6 +66,7 @@ struct Manifest {
     size_t chunk_bytes = 0, pool_bytes = 0, lmhead_pool_bytes = 0, lmhead_chunk_bytes = 0;
     size_t kv_row = 0, ptab_row = 0, rotary_dim = 0, rout_idx_off = 1024;
     double rope_theta = 0;
+    std::vector<double> rope_inv_freq;       ///< per rotary pair (rotary_dim / 2 values; Llama 3's scaling is in here)
     bool has_moe = false;                    ///< layout.moe present (a family with routed experts)
     stream_patch::MoeGeometry moe;
     stream_patch::AttnGeometry attn;

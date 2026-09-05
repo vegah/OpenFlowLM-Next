@@ -45,10 +45,17 @@ def main() -> int:
     a = ap.parse_args()
 
     tk = Tokenizer.from_file(str(Path(a.model) / "tokenizer.json"))
-    prompt = f"<|im_start|>user\n{a.message}<|im_end|>\n<|im_start|>assistant\n"
-    IM_START, IM_END, EOT, THINK, END_THINK, NL, NLNL = special_ids(tk)
-    ids = tk.encode(prompt, add_special_tokens=False).ids
-    ids += [THINK] + NL if a.think else [THINK] + NLNL + [END_THINK] + NLNL
+    if tk.token_to_id("<|start_header_id|>") is not None:
+        # Llama 3: <|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n...<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n
+        prompt = (f"<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{a.message}<|eot_id|>"
+                  f"<|start_header_id|>assistant<|end_header_id|>\n\n")
+        ids = tk.encode(prompt, add_special_tokens=False).ids
+        IM_END, EOT = tk.token_to_id("<|eot_id|>"), tk.token_to_id("<|end_of_text|>")
+    else:
+        prompt = f"<|im_start|>user\n{a.message}<|im_end|>\n<|im_start|>assistant\n"
+        IM_START, IM_END, EOT, THINK, END_THINK, NL, NLNL = special_ids(tk)
+        ids = tk.encode(prompt, add_special_tokens=False).ids
+        ids += [THINK] + NL if a.think else [THINK] + NLNL + [END_THINK] + NLNL
     print(f"prompt: {len(ids)} ids", file=sys.stderr)
 
     cmd = [a.exe, "--model", a.model, "--kernels", a.kernels, "--ids", ",".join(map(str, ids)),

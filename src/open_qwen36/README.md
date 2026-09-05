@@ -1,4 +1,4 @@
-# open_qwen36 — Qwen3.6-MoE (and Qwen3 dense) on open XDNA2 kernels
+# open_qwen36 — Qwen3.6-MoE, Qwen3 dense and Llama 3 on open XDNA2 kernels
 
 The open replacement for the closed `qwen3_6_moe_npu` engine. It sits behind
 the app's `causal_lm` seam ([engine.hpp](engine.hpp)), so the tokenizer, chat
@@ -102,8 +102,9 @@ installed for the model (`xclbins/<model name>/open_kernels/`, or
 `<model dir>/open_kernels/`, or `FLM_OPEN_KERNELS_DIR`); `FLM_QWEN36_ENGINE=closed`
 forces the closed DLL, `=open` fails loudly if the kernels are missing. XRT
 builds only (`FLM_USE_HRX=OFF`), like the open embedding NPU backend. The
-same holds for the `qwen3` dense models (`FLM_QWEN3_ENGINE`): the engine is
-the same code, the manifest is a different recipe's.
+same holds for the `qwen3` dense models (`FLM_QWEN3_ENGINE`) and for
+`llama` (`FLM_LLAMA_ENGINE`): the engine is the same code, the manifest is a
+different recipe's.
 
 ## A second family: Qwen3 dense (2026-09-05)
 
@@ -136,6 +137,33 @@ python src\open_qwen36\chat.py "Explain what an NPU is in two sentences." --mode
 `model/dense_probe.py` compares each stage's DDR bounce (xn, q/k/v, og, out,
 res, xm, h, out2) of a dumped `act` buffer with the replica, fed the NPU's own
 input, so a stage's error is localized rather than compounded.
+
+## A third family: Llama 3 (2026-09-05)
+
+Llama 3.1 8B runs on the same dense recipe (`recipes/dense.py`, family
+`llama3`) with no new kernel: what differs is expressed as spec fields and
+compile-time knobs -- no q/k norms (`ATTN_QKNORM=0`), eps 1e-5 (`LN_EPS`),
+the llama3 RoPE frequency scaling computed host side
+(`ModelSpec.rope_inv_freq`, carried in the manifest, used by both
+position-table builders; it reproduces the container's own `rope_freqs.weight`
+divisors to bf16 precision). Two sizes needed a different shape of the same
+work: the 8 KB norm elements would not fit the norm helper's fused kernel
+(five inputs and three outputs at once = its whole memory), so `ln_y` /
+`ln_xn` emit one element per call; and the K = 14336 activation table (32 KB)
+leaves room for only one 5 KB weight chunk per element (`per_call` in the
+recipe, the GEMV entry generated with it).
+
+```
+python open_kernels/export_qwen36_kernels.py --model-dir ~/.flm/models/Llama-3.1-8B-NPU2     # WSL
+python src\open_qwen36\chat.py "Explain what an NPU is in two sentences." --model %USERPROFILE%\.flm\models\Llama-3.1-8B-NPU2 --kernels src\xclbins\Llama-3.1-8B-NPU2\open_kernels
+```
+
+| check (Llama-3.1-8B, Strix, Windows + XRT) | result |
+|---|---|
+| 4-layer slice, 2 greedy tokens, harness vs the fp64 replica | logits corr 1.000000 / 0.999993, same argmax and top-5, every layer's residual corr ≥ 0.999994 |
+| the same through the engine | identical numbers; request 2 reproduces request 1 |
+| all 32 layers, the NPU prompt, greedy | *An NPU (Neural Processing Unit) is a specialized electronic component designed to accelerate artificial intelligence (AI) and machine learning (ML) workloads, similar to how a Graphics Processing Unit (GPU) accelerates graphics processing. NPUs are optimized to perform matrix operations and other computations that are common in deep learning and neural network processing, allowing for faster and more efficient AI and ML processing.* then `<\|eot_id\|>` at token 79 |
+| speed | prefill 125 ms/token, decode 203 ms/token (4.9 tok/s) for 4.5 GB of q4 weights per token |
 
 Images still route through the closed engine — the open one refuses an image
 payload with a clear error rather than silently ignoring it.

@@ -167,7 +167,7 @@ void build_ptab(const Manifest& m, size_t rows, uint8_t* t) {
         std::memcpy(r, &pos, 4);
         std::memcpy(r + 4, &nf, 4);
         for (size_t i = 0; i < half; ++i) {
-            double ang = static_cast<double>(p) * std::pow(m.rope_theta, -static_cast<double>(i) / static_cast<double>(half));
+            double ang = static_cast<double>(p) * m.rope_inv_freq[i];
             float c = static_cast<float>(std::cos(ang)), s = static_cast<float>(std::sin(ang));
             std::memcpy(r + 512 + 4 * i, &c, 4);
             std::memcpy(r + 512 + 4 * half + 4 * i, &s, 4);

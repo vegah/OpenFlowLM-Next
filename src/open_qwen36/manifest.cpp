@@ -110,6 +110,8 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
     m.ptab_row = get<size_t>(lay, "ptab_row", lw);
     m.rotary_dim = get<size_t>(lay, "rotary_dim", lw);
     m.rope_theta = get<double>(lay, "rope_theta", lw);
+    m.rope_inv_freq = get<std::vector<double>>(lay, "rope_inv_freq", lw);
+    if (m.rope_inv_freq.size() != m.rotary_dim / 2) fail(lw, "rope_inv_freq has " + std::to_string(m.rope_inv_freq.size()) + " values, the rotary dim wants " + std::to_string(m.rotary_dim / 2));
     m.rout_idx_off = lay.value("rout_idx_off", 1024ull);
     m.has_moe = lay.contains("moe");
     if (m.has_moe) {
