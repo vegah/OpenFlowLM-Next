@@ -155,7 +155,7 @@ void pack_lmhead(const Manifest& m, const Q4nxFile& f, uint8_t* out) {
     for (const auto& op : m.lmhead_ops) apply(op, f, 0, out, m.lmhead_pool_bytes, m.chunk_bytes);
 }
 
-void build_ptab(const Manifest& m, size_t rows, uint8_t* t) {
+void build_ptab(const Manifest& m, const RowGlobal& g, size_t rows, uint8_t* t) {
     // RoPE over the first rotary_dim dims of a head, half-split pairs (i, i + rot/2), the recipe's theta:
     // [i32 pos | i32 nf | cos f32[rot/2] @512 | sin f32[rot/2] right after] (attn.h reads [cos | sin] at +512)
     const size_t half = m.rotary_dim / 2;
@@ -163,11 +163,13 @@ void build_ptab(const Manifest& m, size_t rows, uint8_t* t) {
     std::memset(t, 0, rows * m.ptab_row);
     for (size_t p = 0; p < rows; ++p) {
         uint8_t* r = t + p * m.ptab_row;
-        int32_t pos = static_cast<int32_t>(p), nf = static_cast<int32_t>(p ? p : 1);
-        std::memcpy(r, &pos, 4);
+        uint64_t start, nf64;
+        stream_patch::attn_window(p, g.window, &start, &nf64);
+        int32_t valid = static_cast<int32_t>(p - start), nf = static_cast<int32_t>(nf64);
+        std::memcpy(r, &valid, 4);
         std::memcpy(r + 4, &nf, 4);
         for (size_t i = 0; i < half; ++i) {
-            double ang = static_cast<double>(p) * m.rope_inv_freq[i];
+            double ang = static_cast<double>(p) * g.inv_freq[i];
             float c = static_cast<float>(std::cos(ang)), s = static_cast<float>(std::sin(ang));
             std::memcpy(r + 512 + 4 * i, &c, 4);
             std::memcpy(r + 512 + 4 * half + 4 * i, &s, 4);

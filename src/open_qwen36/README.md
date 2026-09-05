@@ -1,4 +1,4 @@
-# open_qwen36 — Qwen3.6-MoE, Qwen3 dense and Llama 3 on open XDNA2 kernels
+# open_qwen36 — Qwen3.6-MoE, Qwen3 dense, Llama 3 and Gemma 3 on open XDNA2 kernels
 
 The open replacement for the closed `qwen3_6_moe_npu` engine. It sits behind
 the app's `causal_lm` seam ([engine.hpp](engine.hpp)), so the tokenizer, chat
@@ -102,9 +102,9 @@ installed for the model (`xclbins/<model name>/open_kernels/`, or
 `<model dir>/open_kernels/`, or `FLM_OPEN_KERNELS_DIR`); `FLM_QWEN36_ENGINE=closed`
 forces the closed DLL, `=open` fails loudly if the kernels are missing. XRT
 builds only (`FLM_USE_HRX=OFF`), like the open embedding NPU backend. The
-same holds for the `qwen3` dense models (`FLM_QWEN3_ENGINE`) and for
-`llama` (`FLM_LLAMA_ENGINE`): the engine is the same code, the manifest is a
-different recipe's.
+same holds for the `qwen3` dense models (`FLM_QWEN3_ENGINE`), for `llama`
+(`FLM_LLAMA_ENGINE`) and for Gemma 3 text models: the engine is the same code,
+the manifest is a different recipe's.
 
 ## A second family: Qwen3 dense (2026-09-05)
 
@@ -164,6 +164,35 @@ python src\open_qwen36\chat.py "Explain what an NPU is in two sentences." --mode
 | the same through the engine | identical numbers; request 2 reproduces request 1 |
 | all 32 layers, the NPU prompt, greedy | *An NPU (Neural Processing Unit) is a specialized electronic component designed to accelerate artificial intelligence (AI) and machine learning (ML) workloads, similar to how a Graphics Processing Unit (GPU) accelerates graphics processing. NPUs are optimized to perform matrix operations and other computations that are common in deep learning and neural network processing, allowing for faster and more efficient AI and ML processing.* then `<\|eot_id\|>` at token 79 |
 | speed | prefill 125 ms/token, decode 203 ms/token (4.9 tok/s) for 4.5 GB of q4 weights per token |
+
+## A fourth family: Gemma 3 (2026-09-05) -- the "new op" proof
+
+Gemma 3 4B (text) runs on the dense recipe with the plan's new ops expressed
+as knobs, patches and one small kernel: GeGLU-tanh is the generated
+activation TU (`dense_act.cc`: x * sigmoid(2z)); the sandwich norms are
+`ln_nr32` (a norm without residual, emitting f32 halves) plus the layer
+design's sandwich program (t = post_attn_norm(out); res = x + t;
+xm = pre_ffn_norm(res); t2 = post_ffn_norm(out2); xres = res + t2); the
+sliding window is a per-token `attnpos` patch (the KV fill's offset and
+length, the record's row counts) on a second kernel entry (`dx_local`) that
+shares the global layers' instruction stream but owns its instruction BO and
+window; each layer type has its own position table (local theta 1e4, global
+1e6 linearly scaled by 8). The container stores the norms' `1 + w` and the
+sqrt(hidden)-scaled embeddings, so those two plan items are not transforms
+here (checked against the HF mirror by range requests).
+
+```
+python open_kernels/export_qwen36_kernels.py --model-dir ~/.flm/models/Gemma3-4B-NPU2     # WSL
+python src\open_qwen36\chat.py "Explain what an NPU is in two sentences." --model %USERPROFILE%\.flm\models\Gemma3-4B-NPU2 --kernels src\xclbins\Gemma3-4B-NPU2\open_kernels
+```
+
+| check (Gemma3-4B, Strix, Windows + XRT) | result |
+|---|---|
+| 6-layer slice (five local, one global), 2 greedy tokens, harness vs the fp64 replica | logits corr 0.999998 / 0.999998, same argmax and top-5, every layer's residual corr 1.000000 (maxrel ≤ 2.5e-4) |
+| the same through the engine | identical numbers; request 2 reproduces request 1 |
+| a step at position 1103 on the 6-layer slice (the window fill offset at row 80, 1023 rows) | finite logits, 94 ms |
+| all 34 layers, the NPU prompt, greedy | *An NPU, or Neural Processing Unit, is a dedicated processor designed to accelerate AI workloads, particularly deep learning tasks. It's optimized for running neural networks much faster and more efficiently than traditional CPUs or GPUs.* then `<end_of_turn>` at token 43 |
+| speed | prefill 63 ms/token, decode 96 ms/token (10.5 tok/s) |
 
 Images still route through the closed engine — the open one refuses an image
 payload with a clear error rather than silently ignoring it.

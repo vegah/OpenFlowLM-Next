@@ -76,7 +76,8 @@ int main(int argc, char** argv) {
           lin.pool[5].op == "std_perm" && lin.pool[5].dst == 505282560 && lin.pool[5].nch == 2048, "pool plan ops");
     check(full.pool[8].op == "std_perm" && full.pool[8].chunk0 == 1024 && full.pool[8].dst == 511836160, "the fused q|gate split");
     check(m.tail.size() == 2 && m.tail[0].kernel == "ln" && m.tail[1].kernel == "lm" && m.tail[1].args.size() == 3, "tail program");
-    check(m.globals.at("logits") == 248320 * 4 && m.globals.at("lmpool") == 542113792 && m.per_row_globals.at("ptab") == 1024, "globals");
+    check(m.globals.at("logits") == 248320 * 4 && m.globals.at("lmpool") == 542113792 && m.per_row_globals.at("ptab").per_row == 1024 &&
+          m.per_row_globals.at("ptab").inv_freq.size() == 32 && m.per_row_globals.at("ptab").window == 0, "globals");
     check(m.embed_tensor == "model.embed_tokens.weight" && m.norm_tensor == "model.norm.weight" && m.lmhead_ops.size() == 1 &&
           m.lmhead_ops[0].op == "lmhead_q8" && m.lmhead_ops[0].tensor == "lm_head.weight" && m.lmhead_ops[0].chunk_bytes == 8704, "tensor names");
     check(m.has_moe, "the 27B manifest carries the MoE geometry");
@@ -141,6 +142,27 @@ int main(int argc, char** argv) {
             refused(d, bad, "intermediate_size", "qwen3: an 8B config is refused by name");
         } catch (const std::exception& e) {
             check(false, std::string("qwen3 fixture: ") + e.what());
+        }
+    }
+    // ---- Gemma 3: two layer types on one stream, windows, two position tables
+    if (argc >= 4) {
+        try {
+            Manifest g = Manifest::load(argv[3]);
+            check(g.family == "gemma3" && g.layers.size() == 34 && g.layers[0] == "dense_local" && g.layers[5] == "dense", "gemma3: 5:1 local / global layers");
+            check(g.kernels.at("dx").window == 0 && g.kernels.at("dx_local").window == 1024 &&
+                  g.kernels.at("dx").insts == g.kernels.at("dx_local").insts, "gemma3: dx / dx_local share a stream, own windows");
+            check(g.per_row_globals.size() == 2 && g.per_row_globals.at("ptab").window == 0 &&
+                  g.per_row_globals.at("ptab_local").window == 1024 && g.per_row_globals.at("ptab_local").inv_freq[0] == 1.0 &&
+                  g.per_row_globals.at("ptab").inv_freq[0] == 0.125, "gemma3: two position tables");
+            check(g.layer_types.at("dense_local").program[0].args.back() == "ptab_local" &&
+                  g.layer_types.at("dense").program[0].args.back() == "ptab", "gemma3: each layer type binds its table");
+            check(g.layer_types.at("dense").consts.size() == 6 && g.hidden == 2560 && g.vocab == 262208 && g.real_vocab == 262145, "gemma3: consts and vocab");
+            uint64_t s0, n0, s1, n1;
+            stream_patch::attn_window(1500, 1024, &s0, &n0);
+            stream_patch::attn_window(0, 1024, &s1, &n1);
+            check(s0 == 477 && n0 == 1023 && s1 == 0 && n1 == 1, "attn_window: [477, 1500) at 1500; a dummy row at 0");
+        } catch (const std::exception& e) {
+            check(false, std::string("gemma3 fixture: ") + e.what());
         }
     }
     std::printf("%s (%d failures)\n", failures ? "FAIL" : "PASS", failures);

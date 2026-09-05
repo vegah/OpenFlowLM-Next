@@ -45,7 +45,12 @@ def main() -> int:
     a = ap.parse_args()
 
     tk = Tokenizer.from_file(str(Path(a.model) / "tokenizer.json"))
-    if tk.token_to_id("<|start_header_id|>") is not None:
+    if tk.token_to_id("<start_of_turn>") is not None:
+        # Gemma: <bos><start_of_turn>user\n...<end_of_turn>\n<start_of_turn>model\n
+        prompt = f"<bos><start_of_turn>user\n{a.message}<end_of_turn>\n<start_of_turn>model\n"
+        ids = tk.encode(prompt, add_special_tokens=False).ids
+        IM_END, EOT = tk.token_to_id("<end_of_turn>"), tk.token_to_id("<eos>")
+    elif tk.token_to_id("<|start_header_id|>") is not None:
         # Llama 3: <|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n...<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n
         prompt = (f"<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{a.message}<|eot_id|>"
                   f"<|start_header_id|>assistant<|end_header_id|>\n\n")

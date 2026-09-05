@@ -106,7 +106,11 @@ void Core::load_kernel(const std::string& name, const KernelDesc& d) {
     std::memcpy(k.instr->map<void*>(), insts.data(), insts.size());
     k.instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
     if (d.patch == "moeroute2") k.moe2 = stream_patch::moe2_table(k.words, name, man_.moe);
-    else if (d.patch == "attnpos") k.attn = stream_patch::attn_table(k.words, name, man_.attn);
+    else if (d.patch == "attnpos") {
+        k.attn = stream_patch::attn_table(k.words, name, man_.attn);
+        k.geom = man_.attn;
+        k.geom.window = d.window;
+    }
 }
 
 xrt::bo Core::alloc(size_t bytes, const uint8_t* init, size_t init_bytes) {
@@ -157,9 +161,9 @@ void Core::load_weights(const std::function<void(int, int)>& progress) {
             globals_[name] = alloc(bytes);
         }
     }
-    for (const auto& [name, row] : man_.per_row_globals) {
-        std::vector<uint8_t> pt(cfg_.max_ctx * row);
-        if (name == "ptab") pools::build_ptab(man_, cfg_.max_ctx, pt.data());
+    for (const auto& [name, rg] : man_.per_row_globals) {
+        std::vector<uint8_t> pt(cfg_.max_ctx * rg.per_row);
+        pools::build_ptab(man_, rg, cfg_.max_ctx, pt.data());
         globals_[name] = alloc(pt.size(), pt.data(), pt.size());
     }
     file_->drop_pages();  // the packers are done with the container; keep only what the steps touch
@@ -240,7 +244,7 @@ void Core::step(int token, bool want_logits) {
     xres.sync(XCL_BO_SYNC_BO_TO_DEVICE, man_.hidden * 4, 0);
     for (auto& [name, k] : kerns_) {
         if (k.patch != "attnpos") continue;
-        stream_patch::attn_apply(k.iw(), k.attn, static_cast<uint64_t>(pos_), man_.attn);
+        stream_patch::attn_apply(k.iw(), k.attn, static_cast<uint64_t>(pos_), k.geom);
         k.instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
     }
     for (int l = 0; l < nl_; ++l) {

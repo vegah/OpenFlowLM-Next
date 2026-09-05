@@ -139,6 +139,7 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
         d.context = get<std::string>(v, "context", where + " kernel " + k);
         d.insts = get<std::string>(v, "insts", where + " kernel " + k);
         d.patch = v.value("patch", "");
+        d.window = v.value("window", 0ull);
         if (!m.contexts.count(d.context)) fail(where, "kernel " + k + " names unknown context " + d.context);
         if (!d.patch.empty() && d.patch != "moeroute2" && d.patch != "attnpos") fail(where, "kernel " + k + ": unknown patch " + d.patch);
         if (d.patch == "moeroute2" && !m.has_moe) fail(where, "kernel " + k + " wants moeroute2 but layout.moe is absent");
@@ -170,9 +171,18 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
     for (const auto& s : m.tail)
         if (!m.kernels.count(s.kernel)) fail(where, "tail names unknown kernel " + s.kernel);
     for (const auto& [k, v] : need(j, "globals", where).items()) {
-        if (v.is_number()) m.globals[k] = v.get<uint64_t>();
-        else if (v.is_object() && v.contains("per_row")) m.per_row_globals[k] = v["per_row"].get<uint64_t>();
-        else fail(where, "global " + k + " is neither a size nor {per_row}");
+        if (v.is_number()) {
+            m.globals[k] = v.get<uint64_t>();
+        } else if (v.is_object() && v.contains("per_row")) {
+            RowGlobal rg;
+            rg.per_row = v["per_row"].get<uint64_t>();
+            rg.inv_freq = v.value("inv_freq", m.rope_inv_freq);
+            rg.window = v.value("window", 0ull);
+            if (rg.inv_freq.size() != m.rotary_dim / 2) fail(where, "global " + k + ": inv_freq has " + std::to_string(rg.inv_freq.size()) + " values");
+            m.per_row_globals[k] = rg;
+        } else {
+            fail(where, "global " + k + " is neither a size nor {per_row}");
+        }
     }
     const json& pack = need(j, "pack", where);
     m.embed_tensor = get<std::string>(need(pack, "embed", where), "tensor", where + " pack.embed");

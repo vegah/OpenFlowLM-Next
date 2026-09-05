@@ -112,6 +112,7 @@ private:
         std::vector<uint32_t> words;
         std::vector<stream_patch::MoePatch> moe2;
         std::vector<stream_patch::AttnPatch> attn;
+        stream_patch::AttnGeometry geom;     ///< attnpos: the manifest's rows plus this kernel's window
         uint32_t* iw() { return instr->map<uint32_t*>(); }
     };
 

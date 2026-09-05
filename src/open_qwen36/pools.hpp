@@ -33,8 +33,9 @@ void pack_pool(const Manifest& m, const LayerType& lt, const Q4nxFile& f, int la
 void pack_consts(const Manifest& m, const LayerType& lt, const Q4nxFile& f, int layer, uint8_t* dst);
 /// The lm_head pool (m.lmhead_pool_bytes): the manifest's pack.lm_head ops.
 void pack_lmhead(const Manifest& m, const Q4nxFile& f, uint8_t* dst);
-/// The position record table: row p = [pos | nf = max(p,1) | cos | sin], `rows` rows of m.ptab_row.
-void build_ptab(const Manifest& m, size_t rows, uint8_t* dst);
+/// A position record table: row p = [valid | nf | cos | sin] for the window's row counts
+/// (stream_patch::attn_window) and these RoPE frequencies, `rows` rows of m.ptab_row.
+void build_ptab(const Manifest& m, const RowGlobal& g, size_t rows, uint8_t* dst);
 
 }  // namespace pools
 }  // namespace open_qwen36

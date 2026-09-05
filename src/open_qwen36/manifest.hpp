@@ -55,6 +55,14 @@ struct KernelDesc {
     std::string context;                     ///< name in Manifest::contexts
     std::string insts;                       ///< relative path of insts.bin
     std::string patch;                       ///< "" | moeroute2 | attnpos
+    uint64_t window = 0;                     ///< attnpos: the sliding window (rows; 0 = every cached row)
+};
+
+/// A global sized max_ctx x row: the position record table(s).
+struct RowGlobal {
+    uint64_t per_row = 0;
+    std::vector<double> inv_freq;            ///< its RoPE frequencies (rotary_dim / 2)
+    uint64_t window = 0;                     ///< the row counts follow this window
 };
 
 struct Manifest {
@@ -77,7 +85,7 @@ struct Manifest {
     std::map<std::string, LayerType> layer_types;
     std::vector<Step> tail;
     std::map<std::string, uint64_t> globals;          ///< fixed-size global buffers (bytes)
-    std::map<std::string, uint64_t> per_row_globals;  ///< globals sized max_ctx x row (the ptab)
+    std::map<std::string, RowGlobal> per_row_globals; ///< globals sized max_ctx x row (the ptab(s))
     std::string embed_tensor, norm_tensor;
     std::vector<PackOp> lmhead_ops;          ///< pack.lm_head.ops into the lmpool global
     size_t norm_bytes = 0;
