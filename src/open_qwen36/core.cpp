@@ -1,5 +1,5 @@
 /// \file core.cpp
-/// \brief The resident open-kernel decode engine (see core.hpp).
+/// \brief The resident open-kernel decode engine: a manifest interpreter (see core.hpp).
 #include "open_qwen36/core.hpp"
 
 #include <chrono>
@@ -9,14 +9,12 @@
 #include <fstream>
 #include <stdexcept>
 
-#include "nlohmann/json.hpp"
 #include "xrt/experimental/xrt_ext.h"
 #include "xrt/experimental/xrt_xclbin.h"
 
 namespace open_qwen36 {
 
 namespace fs = std::filesystem;
-using namespace layout;
 
 namespace {
 
@@ -45,69 +43,61 @@ void Core::log(const std::string& s) const {
 }
 
 Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
-    // ---- the model: config.json for the layer schedule, the container for the weights
+    // ---- the kernel set's manifest, and the model it must agree with
+    man_ = Manifest::load((fs::path(cfg_.kernel_dir) / "manifest.json").string());
     fs::path md(cfg_.model_dir);
     std::ifstream cf(md / "config.json");
     if (!cf) throw std::runtime_error("open_qwen36: no config.json in " + cfg_.model_dir);
     auto j = nlohmann::json::parse(cf, nullptr, false);
     if (!j.is_object()) throw std::runtime_error("open_qwen36: bad config.json in " + cfg_.model_dir);
-    int total = j.value("num_hidden_layers", 0);
-    interval_ = j.value("full_attention_interval", 4);
-    if (total <= 0 || interval_ <= 0) throw std::runtime_error("open_qwen36: config.json lacks num_hidden_layers / full_attention_interval");
-    if (j.value("hidden_size", 0) != static_cast<int>(HIDDEN) || j.value("vocab_size", 0) != static_cast<int>(VOCAB) ||
-        j.value("num_experts", 0) != 256 || j.value("moe_intermediate_size", 0) != 512)
-        throw std::runtime_error("open_qwen36: the open kernels are built for hidden 2048 / vocab 248320 / 256 experts x 512; this config differs");
+    man_.check_model(j, md.filename().string());
+    int total = static_cast<int>(man_.layers.size());
     nl_ = cfg_.num_layers > 0 && cfg_.num_layers < total ? cfg_.num_layers : total;
-    full_.resize(nl_);
-    for (int l = 0; l < nl_; ++l) {
-        full_[l] = ((l + 1) % interval_ == 0);
-        (full_[l] ? has_attn_ : has_lin_) = true;
-    }
+    types_.resize(nl_);
+    for (int l = 0; l < nl_; ++l) types_[l] = &man_.layer_type(l);
     file_ = std::make_unique<Q4nxFile>((md / "model.q4nx").string());
-    log("model " + md.filename().string() + ": " + std::to_string(nl_) + " of " + std::to_string(total) +
-        " layers, attention every " + std::to_string(interval_) + "th, context capacity " + std::to_string(cfg_.max_ctx));
+    int nattn = 0;
+    for (int l = 0; l < nl_; ++l) nattn += is_attention_layer(l);
+    log("model " + md.filename().string() + " (" + man_.family + ", " + man_.spec_hash.substr(0, 19) + "): " +
+        std::to_string(nl_) + " of " + std::to_string(total) + " layers, " + std::to_string(nattn) +
+        " attention, context capacity " + std::to_string(cfg_.max_ctx));
 
-    // ---- device, contexts, kernels
+    // ---- device, contexts, kernels (only the kernels the running layers' programs and the tail name)
     if (dev) {
         dev_ = dev;
     } else {
         owned_dev_ = std::make_unique<xrt::device>(0u);
         dev_ = owned_dev_.get();
     }
-    if (has_lin_) {
-        auto& cx = load_context(ctx_x_, "lx0");
-        load_kernel(lx0_, cx, "lx0");
-        load_kernel(lx1_, cx, "lx1");
-        lx1_.moe2 = stream_patch::moe2_table(lx1_.words, "lx1");
-    }
-    if (has_attn_) {
-        auto& cy = load_context(ctx_y_, "ax0");
-        load_kernel(ax0_, cy, "ax0");
-        load_kernel(ax1_, cy, "ax1");
-        ax0_.attn = stream_patch::attn_table(ax0_.words, "ax0");
-        ax1_.moe2 = stream_patch::moe2_table(ax1_.words, "ax1");
-    }
-    load_kernel(ln_, load_context(ctx_l_, "ln"), "ln");
-    load_kernel(lm_, load_context(ctx_k_, "lm_head_q8"), "lm_head_q8");
-    logits_host_.assign(VOCAB, 0.f);
+    std::map<std::string, bool> wanted;
+    for (int l = 0; l < nl_; ++l)
+        for (const auto& s : types_[l]->program) wanted[s.kernel] = true;
+    for (const auto& s : man_.tail) wanted[s.kernel] = true;
+    for (const auto& [name, d] : man_.kernels)
+        if (wanted.count(name)) load_kernel(name, d);
+    logits_host_.assign(man_.vocab, 0.f);
 }
 
 Core::~Core() = default;
 
-xrt::hw_context& Core::load_context(std::unique_ptr<xrt::hw_context>& ctx, const std::string& design) {
-    fs::path p = fs::path(cfg_.kernel_dir) / design / "final.xclbin";
+xrt::hw_context& Core::context(const std::string& name) {
+    auto it = ctxs_.find(name);
+    if (it != ctxs_.end()) return *it->second;
+    fs::path p = fs::path(cfg_.kernel_dir) / man_.contexts.at(name);
     if (!fs::exists(p)) throw std::runtime_error("open_qwen36: missing kernel " + p.string());
     xrt::xclbin xcl(p.string());
     auto uuid = dev_->register_xclbin(xcl);
-    ctx = std::make_unique<xrt::hw_context>(*dev_, uuid);
-    return *ctx;
+    auto ctx = std::make_unique<xrt::hw_context>(*dev_, uuid);
+    return *(ctxs_[name] = std::move(ctx));
 }
 
-void Core::load_kernel(Kern& k, xrt::hw_context& ctx, const std::string& design) {
-    fs::path p = fs::path(cfg_.kernel_dir) / design / "insts.bin";
+void Core::load_kernel(const std::string& name, const KernelDesc& d) {
+    fs::path p = fs::path(cfg_.kernel_dir) / d.insts;
     if (!fs::exists(p)) throw std::runtime_error("open_qwen36: missing instruction stream " + p.string());
-    k.name = design;
-    k.k = std::make_unique<xrt::kernel>(ctx, "MLIR_AIE");
+    Kern& k = kerns_[name];
+    k.name = name;
+    k.patch = d.patch;
+    k.k = std::make_unique<xrt::kernel>(context(d.context), "MLIR_AIE");
     auto insts = read_file(p);
     if (insts.empty() || insts.size() % 4) throw std::runtime_error("open_qwen36: " + p.string() + " is not word-sized");
     k.words.resize(insts.size() / 4);
@@ -115,6 +105,12 @@ void Core::load_kernel(Kern& k, xrt::hw_context& ctx, const std::string& design)
     k.instr = std::make_unique<xrt::bo>(*dev_, insts.size(), xrt::bo::flags::cacheable, k.k->group_id(1));
     std::memcpy(k.instr->map<void*>(), insts.data(), insts.size());
     k.instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    if (d.patch == "moeroute2") k.moe2 = stream_patch::moe2_table(k.words, name, man_.moe);
+    else if (d.patch == "attnpos") {
+        k.attn = stream_patch::attn_table(k.words, name, man_.attn);
+        k.geom = man_.attn;
+        k.geom.window = d.window;
+    }
 }
 
 xrt::bo Core::alloc(size_t bytes, const uint8_t* init, size_t init_bytes) {
@@ -128,48 +124,48 @@ xrt::bo Core::alloc(size_t bytes, const uint8_t* init, size_t init_bytes) {
 
 void Core::load_weights(const std::function<void(int, int)>& progress) {
     auto t0 = std::chrono::steady_clock::now();
-    pools_.clear(); consts_.clear(); act_.clear(); state_.clear();
+    pools_.clear(); consts_.clear(); act_.clear(); state_.clear(); globals_.clear();
     pools_.reserve(nl_); consts_.reserve(nl_); act_.reserve(nl_); state_.reserve(nl_);
     for (int l = 0; l < nl_; ++l) {
-        xrt::bo pool = xrt::ext::bo(*dev_, kPoolBytes);
-        pools::build_layer_pool(*file_, l, full_[l], pool.map<uint8_t*>());
+        const LayerType& lt = *types_[l];
+        xrt::bo pool = xrt::ext::bo(*dev_, man_.pool_bytes);
+        pools::pack_pool(man_, lt, *file_, l, pool.map<uint8_t*>());
         pool.sync(XCL_BO_SYNC_BO_TO_DEVICE);
         pools_.push_back(std::move(pool));
-        size_t cb = full_[l] ? CA_BYTES : C_BYTES;
-        xrt::bo c = xrt::ext::bo(*dev_, padup(cb));
-        std::memset(c.map<uint8_t*>(), 0, padup(cb));
-        pools::build_consts(*file_, l, full_[l], c.map<uint8_t*>());
+        xrt::bo c = xrt::ext::bo(*dev_, padup(lt.consts_bytes));
+        std::memset(c.map<uint8_t*>(), 0, padup(lt.consts_bytes));
+        pools::pack_consts(man_, lt, *file_, l, c.map<uint8_t*>());
         c.sync(XCL_BO_SYNC_BO_TO_DEVICE);
         consts_.push_back(std::move(c));
-        act_.push_back(alloc(full_[l] ? AA_BYTES : A_BYTES));
-        state_.push_back(alloc(full_[l] ? cfg_.max_ctx * KV_ROW : STATE_BYTES));
+        act_.push_back(alloc(lt.act_bytes));
+        state_.push_back(alloc(lt.state_kind == "kv" ? cfg_.max_ctx * lt.state_row : lt.state_bytes));
         if (progress) progress(l + 1, nl_ + 1);
         if ((l + 1) % 10 == 0 || l + 1 == nl_)
             log(std::to_string(l + 1) + "/" + std::to_string(nl_) + " layers resident (" +
                 std::to_string(static_cast<int>(ms_since(t0) / 1000)) + " s)");
     }
-    {
-        xrt::bo lm = xrt::ext::bo(*dev_, kLmheadPoolBytes);
-        pools::build_lmhead_pool(*file_, lm.map<uint8_t*>());
-        lm.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-        lmpool_ = std::move(lm);
+    // ---- the globals: the lm_head pool and the final norm's weight from the file, the ptab
+    // computed, everything else zero (xres, zero, xresf, hn, logits)
+    for (const auto& [name, bytes] : man_.globals) {
+        if (name == "lmpool") {
+            xrt::bo lm = xrt::ext::bo(*dev_, bytes);
+            pools::pack_lmhead(man_, *file_, lm.map<uint8_t*>());
+            lm.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            globals_[name] = std::move(lm);
+        } else if (name == "normw") {
+            size_t n = 0;
+            const uint8_t* nw = file_->raw(man_.norm_tensor, &n);
+            if (n != man_.norm_bytes) throw std::runtime_error("open_qwen36: " + man_.norm_tensor + " is not " + std::to_string(man_.norm_bytes) + " B");
+            globals_[name] = alloc(bytes, nw, n);
+        } else {
+            globals_[name] = alloc(bytes);
+        }
     }
-    {
-        std::vector<uint8_t> pt(cfg_.max_ctx * PTAB_ROW);
-        pools::build_ptab(cfg_.max_ctx, pt.data());
-        ptab_ = alloc(pt.size(), pt.data(), pt.size());
+    for (const auto& [name, rg] : man_.per_row_globals) {
+        std::vector<uint8_t> pt(cfg_.max_ctx * rg.per_row);
+        pools::build_ptab(man_, rg, cfg_.max_ctx, pt.data());
+        globals_[name] = alloc(pt.size(), pt.data(), pt.size());
     }
-    {
-        size_t n = 0;
-        const uint8_t* nw = file_->raw("model.norm.weight", &n);
-        if (n != HIDDEN * 2) throw std::runtime_error("open_qwen36: model.norm.weight is not bf16[2048]");
-        normw_ = alloc(n, nw, n);
-    }
-    xres_ = alloc(HIDDEN * 4);
-    zero_ = alloc(HIDDEN * 4);
-    xresf_ = alloc(HIDDEN * 4);
-    hn_ = alloc(HIDDEN * 2);
-    logits_ = alloc(LOGITS_BYTES);
     file_->drop_pages();  // the packers are done with the container; keep only what the steps touch
     if (progress) progress(nl_ + 1, nl_ + 1);
     weights_loaded_ = true;
@@ -180,25 +176,36 @@ void Core::load_weights(const std::function<void(int, int)>& progress) {
 
 void Core::reset() {
     if (!weights_loaded_) throw std::runtime_error("open_qwen36: reset before load_weights");
-    // The linear layers' conv state and S must start at zero. The KV rows
-    // need not: the window read is [0, max(pos, 1)) and row 0 at position 0
-    // is a dummy the kernel masks.
+    // The linear layers' state must start at zero. The KV rows need not: the
+    // window read is [0, max(pos, 1)) and row 0 at position 0 is a dummy the
+    // kernel masks.
     for (int l = 0; l < nl_; ++l) {
-        if (full_[l]) continue;
-        std::memset(state_[l].map<uint8_t*>(), 0, STATE_BYTES);
-        state_[l].sync(XCL_BO_SYNC_BO_TO_DEVICE, STATE_BYTES, 0);
+        const LayerType& lt = *types_[l];
+        if (lt.state_kind != "linear") continue;
+        std::memset(state_[l].map<uint8_t*>(), 0, lt.state_bytes);
+        state_[l].sync(XCL_BO_SYNC_BO_TO_DEVICE, lt.state_bytes, 0);
     }
     pos_ = 0;
 }
 
-double Core::run(Kern& k, std::initializer_list<xrt::bo*> bufs) {
+xrt::bo& Core::buffer(const std::string& name, int layer) {
+    if (name == "pool") return pools_[layer];
+    if (name == "consts") return consts_[layer];
+    if (name == "act") return act_[layer];
+    if (name == "state") return state_[layer];
+    auto it = globals_.find(name);
+    if (it == globals_.end()) throw std::runtime_error("open_qwen36: the program names an unknown buffer '" + name + "'");
+    return it->second;
+}
+
+double Core::run(Kern& k, const std::vector<std::string>& args, int layer) {
     auto t0 = std::chrono::steady_clock::now();
     xrt::run r(*k.k);
     r.set_arg(0, kOpcode);
     r.set_arg(1, *k.instr);
     r.set_arg(2, static_cast<int>(k.words.size()));
     int i = 3;
-    for (xrt::bo* b : bufs) r.set_arg(i++, *b);
+    for (const auto& a : args) r.set_arg(i++, buffer(a, layer));
     r.start();
     auto st = cfg_.timeout_ms ? r.wait(std::chrono::milliseconds(cfg_.timeout_ms)) : r.wait();
     if (st != ERT_CMD_STATE_COMPLETED)
@@ -208,17 +215,19 @@ double Core::run(Kern& k, std::initializer_list<xrt::bo*> bufs) {
     return ms_since(t0);
 }
 
-void Core::route_and_run_part1(Kern& part1, xrt::bo& act, size_t rout_off, std::initializer_list<xrt::bo*> bufs) {
+void Core::route(Kern& k, int layer, uint64_t act_off) {
     auto t0 = std::chrono::steady_clock::now();
-    act.sync(XCL_BO_SYNC_BO_FROM_DEVICE, 32, rout_off + ROUT_IDX_OFF);
+    if (k.moe2.empty()) throw std::runtime_error("open_qwen36: moeroute2 on " + k.name + ", which has no routed-expert table");
+    xrt::bo& act = act_[layer];
+    const size_t off = act_off + man_.rout_idx_off;
+    act.sync(XCL_BO_SYNC_BO_FROM_DEVICE, 32, off);
     uint32_t idx[8];
-    std::memcpy(idx, act.map<uint8_t*>() + rout_off + ROUT_IDX_OFF, 32);
-    for (uint32_t e : idx)
-        if (e >= 256) throw std::runtime_error("open_qwen36: router produced expert index " + std::to_string(e));
-    stream_patch::moe2_apply(part1.iw(), part1.moe2, idx);
-    part1.instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    std::memcpy(idx, act.map<uint8_t*>() + off, 32);
+    for (unsigned s = 0; s < man_.moe.topk; ++s)
+        if (idx[s] >= man_.moe.experts) throw std::runtime_error("open_qwen36: router produced expert index " + std::to_string(idx[s]));
+    stream_patch::moe2_apply(k.iw(), k.moe2, idx, man_.moe);
+    k.instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
     timing_.route_ms += ms_since(t0);
-    timing_.part1_ms += run(part1, bufs);
 }
 
 void Core::step(int token, bool want_logits) {
@@ -226,31 +235,36 @@ void Core::step(int token, bool want_logits) {
     if (static_cast<size_t>(pos_) >= cfg_.max_ctx)
         throw std::runtime_error("open_qwen36: position " + std::to_string(pos_) + " reached the context capacity " +
                                  std::to_string(cfg_.max_ctx));
-    if (token < 0 || static_cast<size_t>(token) >= VOCAB) throw std::runtime_error("open_qwen36: token id out of range");
+    if (token < 0 || static_cast<size_t>(token) >= man_.vocab) throw std::runtime_error("open_qwen36: token id out of range");
     auto t0 = std::chrono::steady_clock::now();
     timing_ = StepTiming{};
 
-    file_->bf16_row("model.embed_tokens.weight", static_cast<size_t>(token), HIDDEN, xres_.map<float*>());
-    xres_.sync(XCL_BO_SYNC_BO_TO_DEVICE, HIDDEN * 4, 0);
-    if (has_attn_) {
-        stream_patch::attn_apply(ax0_.iw(), ax0_.attn, static_cast<uint64_t>(pos_));
-        ax0_.instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    xrt::bo& xres = buffer("xres", 0);
+    file_->bf16_row(man_.embed_tensor, static_cast<size_t>(token), man_.hidden, xres.map<float*>());
+    xres.sync(XCL_BO_SYNC_BO_TO_DEVICE, man_.hidden * 4, 0);
+    for (auto& [name, k] : kerns_) {
+        if (k.patch != "attnpos") continue;
+        stream_patch::attn_apply(k.iw(), k.attn, static_cast<uint64_t>(pos_), k.geom);
+        k.instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
     }
     for (int l = 0; l < nl_; ++l) {
-        if (full_[l]) {
-            timing_.part0_ms += run(ax0_, {&pools_[l], &xres_, &consts_[l], &state_[l], &act_[l], &ptab_});
-            route_and_run_part1(ax1_, act_[l], AA_ROUT, {&pools_[l], &xres_, &consts_[l], &state_[l], &act_[l], &ptab_});
-        } else {
-            timing_.part0_ms += run(lx0_, {&pools_[l], &xres_, &consts_[l], &state_[l], &act_[l]});
-            route_and_run_part1(lx1_, act_[l], A_ROUT, {&pools_[l], &xres_, &consts_[l], &state_[l], &act_[l]});
+        int nrun = 0;
+        for (const Step& s : types_[l]->program) {
+            Kern& k = kerns_.at(s.kernel);
+            if (s.op == "run") {
+                double ms = run(k, s.args, l);
+                (nrun++ == 0 ? timing_.part0_ms : timing_.part1_ms) += ms;
+            } else {
+                route(k, l, s.act_off);
+            }
         }
     }
     if (want_logits) {
         auto t1 = std::chrono::steady_clock::now();
-        run(ln_, {&xres_, &zero_, &normw_, &xresf_, &hn_});
-        run(lm_, {&lmpool_, &hn_, &logits_});
-        logits_.sync(XCL_BO_SYNC_BO_FROM_DEVICE, LOGITS_BYTES, 0);
-        std::memcpy(logits_host_.data(), logits_.map<uint8_t*>(), LOGITS_BYTES);
+        for (const Step& s : man_.tail) run(kerns_.at(s.kernel), s.args, 0);
+        xrt::bo& lg = buffer("logits", 0);
+        lg.sync(XCL_BO_SYNC_BO_FROM_DEVICE, man_.vocab * 4, 0);
+        std::memcpy(logits_host_.data(), lg.map<uint8_t*>(), man_.vocab * 4);
         timing_.lmhead_ms = ms_since(t1);
     }
     ++pos_;
@@ -266,9 +280,10 @@ Snapshot Core::checkpoint() const {
     Snapshot s;
     s.pos = pos_;
     for (int l = 0; l < nl_; ++l) {
+        const LayerType& lt = *types_[l];
         xrt::bo& bo = const_cast<xrt::bo&>(state_[l]);
-        if (full_[l]) {
-            size_t n = static_cast<size_t>(pos_) * KV_ROW;
+        if (lt.state_kind == "kv") {
+            size_t n = static_cast<size_t>(pos_) * lt.state_row;
             std::vector<uint8_t> rows(n);
             if (n) {
                 bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE, n, 0);
@@ -276,9 +291,9 @@ Snapshot Core::checkpoint() const {
             }
             s.kv.push_back(std::move(rows));
         } else {
-            std::vector<uint8_t> st(STATE_BYTES);
-            bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE, STATE_BYTES, 0);
-            std::memcpy(st.data(), bo.map<uint8_t*>(), STATE_BYTES);
+            std::vector<uint8_t> st(lt.state_bytes);
+            bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE, lt.state_bytes, 0);
+            std::memcpy(st.data(), bo.map<uint8_t*>(), lt.state_bytes);
             s.states.push_back(std::move(st));
         }
     }
@@ -288,7 +303,8 @@ Snapshot Core::checkpoint() const {
 void Core::restore(const Snapshot& s) {
     size_t il = 0, ia = 0;
     for (int l = 0; l < nl_; ++l) {
-        if (full_[l]) {
+        const LayerType& lt = *types_[l];
+        if (lt.state_kind == "kv") {
             const auto& rows = s.kv.at(ia++);
             if (!rows.empty()) {
                 std::memcpy(state_[l].map<uint8_t*>(), rows.data(), rows.size());
@@ -296,19 +312,21 @@ void Core::restore(const Snapshot& s) {
             }
         } else {
             const auto& st = s.states.at(il++);
-            std::memcpy(state_[l].map<uint8_t*>(), st.data(), STATE_BYTES);
-            state_[l].sync(XCL_BO_SYNC_BO_TO_DEVICE, STATE_BYTES, 0);
+            if (st.size() != lt.state_bytes) throw std::runtime_error("open_qwen36: snapshot state size mismatch");
+            std::memcpy(state_[l].map<uint8_t*>(), st.data(), lt.state_bytes);
+            state_[l].sync(XCL_BO_SYNC_BO_TO_DEVICE, lt.state_bytes, 0);
         }
     }
     pos_ = s.pos;
 }
 
 void Core::kv_row(int layer, int row, bool value, uint16_t* out) {
-    if (layer < 0 || layer >= nl_ || !full_[layer]) throw std::runtime_error("open_qwen36: layer " + std::to_string(layer) + " has no KV cache");
+    if (layer < 0 || layer >= nl_ || !is_attention_layer(layer)) throw std::runtime_error("open_qwen36: layer " + std::to_string(layer) + " has no KV cache");
     if (row < 0 || static_cast<size_t>(row) >= cfg_.max_ctx) throw std::runtime_error("open_qwen36: KV row out of range");
-    size_t off = static_cast<size_t>(row) * KV_ROW + (value ? KV_ROW / 2 : 0);
-    state_[layer].sync(XCL_BO_SYNC_BO_FROM_DEVICE, KV_ROW / 2, off);
-    std::memcpy(out, state_[layer].map<uint8_t*>() + off, KV_ROW / 2);
+    const size_t kv_row = types_[layer]->state_row;
+    size_t off = static_cast<size_t>(row) * kv_row + (value ? kv_row / 2 : 0);
+    state_[layer].sync(XCL_BO_SYNC_BO_FROM_DEVICE, kv_row / 2, off);
+    std::memcpy(out, state_[layer].map<uint8_t*>() + off, kv_row / 2);
 }
 
 }  // namespace open_qwen36

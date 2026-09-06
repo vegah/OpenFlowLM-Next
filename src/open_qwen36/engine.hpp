@@ -45,7 +45,8 @@ public:
 
     /// Where this model's open kernels are: FLM_OPEN_KERNELS_DIR, else
     /// <model>/open_kernels, else <xclbin prefix>/xclbins/<model name>/open_kernels.
-    /// Empty when none is found — the caller then keeps the closed engine.
+    /// A kernel set is a manifest.json plus the files it names. Empty when
+    /// none is found — the caller then keeps the closed engine.
     static std::string find_kernels(const LM_Config& config);
 
     const Core& core() const { return *core_; }

@@ -20,7 +20,15 @@ from pathlib import Path
 from tokenizers import Tokenizer
 
 HERE = Path(__file__).resolve().parent
-IM_START, IM_END, EOT, THINK, END_THINK, NL, NLNL = 248045, 248046, 248044, 248068, 248069, 198, 271
+def special_ids(tk):
+    """<|im_start|>, <|im_end|>, <|endoftext|>, <think>, </think> by name; the newline ids by encoding."""
+    ids = {t: tk.token_to_id(t) for t in ("<|im_start|>", "<|im_end|>", "<|endoftext|>", "<think>", "</think>")}
+    missing = [t for t, i in ids.items() if i is None]
+    if missing:
+        raise SystemExit(f"tokenizer lacks {missing}")
+    nl = tk.encode(chr(10), add_special_tokens=False).ids
+    nlnl = tk.encode(chr(10) * 2, add_special_tokens=False).ids
+    return ids["<|im_start|>"], ids["<|im_end|>"], ids["<|endoftext|>"], ids["<think>"], ids["</think>"], nl, nlnl
 
 
 def main() -> int:
@@ -37,9 +45,31 @@ def main() -> int:
     a = ap.parse_args()
 
     tk = Tokenizer.from_file(str(Path(a.model) / "tokenizer.json"))
-    prompt = f"<|im_start|>user\n{a.message}<|im_end|>\n<|im_start|>assistant\n"
-    ids = tk.encode(prompt, add_special_tokens=False).ids
-    ids += [THINK, NL] if a.think else [THINK, NLNL, END_THINK, NLNL]
+
+    def ids_of(*names):
+        """The named tokens' ids; a family whose tokenizer lacks one would run past EOS."""
+        got = {n: tk.token_to_id(n) for n in names}
+        missing = [n for n, i in got.items() if i is None]
+        if missing:
+            raise SystemExit(f"tokenizer lacks {missing}")
+        return [got[n] for n in names]
+
+    if tk.token_to_id("<start_of_turn>") is not None:
+        # Gemma: <bos><start_of_turn>user\n...<end_of_turn>\n<start_of_turn>model\n
+        prompt = f"<bos><start_of_turn>user\n{a.message}<end_of_turn>\n<start_of_turn>model\n"
+        ids = tk.encode(prompt, add_special_tokens=False).ids
+        IM_END, EOT = ids_of("<end_of_turn>", "<eos>")
+    elif tk.token_to_id("<|start_header_id|>") is not None:
+        # Llama 3: <|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n...<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n
+        prompt = (f"<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{a.message}<|eot_id|>"
+                  f"<|start_header_id|>assistant<|end_header_id|>\n\n")
+        ids = tk.encode(prompt, add_special_tokens=False).ids
+        IM_END, EOT = ids_of("<|eot_id|>", "<|end_of_text|>")
+    else:
+        prompt = f"<|im_start|>user\n{a.message}<|im_end|>\n<|im_start|>assistant\n"
+        IM_START, IM_END, EOT, THINK, END_THINK, NL, NLNL = special_ids(tk)
+        ids = tk.encode(prompt, add_special_tokens=False).ids
+        ids += [THINK] + NL if a.think else [THINK] + NLNL + [END_THINK] + NLNL
     print(f"prompt: {len(ids)} ids", file=sys.stderr)
 
     cmd = [a.exe, "--model", a.model, "--kernels", a.kernels, "--ids", ",".join(map(str, ids)),

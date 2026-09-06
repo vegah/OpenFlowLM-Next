@@ -4,14 +4,14 @@
 ///        the way to run the engine on a box where the app itself does not
 ///        build (this one: no Boost / vcpkg / tokenizers-cpp).
 ///
-///   open_qwen36_cli --model <dir> --kernels <dir> --ids 1,2,3 [--max-tokens N]
+///   open_qwen36_cli --model <dir> --kernels <dir (manifest.json + xclbins)> --ids 1,2,3 [--max-tokens N]
 ///       [--layers N] [--max-ctx N] [--dump-logits <prefix>] [--twice]
 ///       [--at-position P] [--ids-file <path>]
 ///
 /// The prompt ids are prefilled by sequential decode (logits skipped), then
 /// greedy decode runs for --max-tokens. Each produced id is printed on its
 /// own line as `token <id>` so a wrapper can detokenize (tools/chat.py).
-/// --dump-logits writes `<prefix>_t<i>.bin` (f32[248320]) for every position
+/// --dump-logits writes `<prefix>_t<i>.bin` (f32[vocab]) for every position
 /// with logits, which compare_decode.py can score. --twice runs the whole
 /// request a second time on the same resident engine (state reset check).
 /// --at-position P first seeks to position P with no cache rows in between
@@ -124,7 +124,7 @@ std::vector<int> request(Core& core, const Args& a) {
 
     std::vector<int> out;
     auto t1 = clock::now();
-    int tok = argmax(core.logits(), open_qwen36::layout::REAL_VOCAB);
+    int tok = argmax(core.logits(), core.real_vocab());
     for (int n = 0; n < a.max_tokens; ++n) {
         out.push_back(tok);
         std::printf("token %d\n", tok);
@@ -135,7 +135,7 @@ std::vector<int> request(Core& core, const Args& a) {
         const auto& tm = core.last_timing();
         std::fprintf(stderr, "  step @%d: %.1f ms (part0 %.1f, route %.2f, part1 %.1f, lm_head %.1f)\n", core.position() - 1,
                      tm.total_ms, tm.part0_ms, tm.route_ms, tm.part1_ms, tm.lmhead_ms);
-        tok = argmax(core.logits(), open_qwen36::layout::REAL_VOCAB);
+        tok = argmax(core.logits(), core.real_vocab());
     }
     double dec_ms = std::chrono::duration<double, std::milli>(clock::now() - t1).count();
     if (out.size() > 1)

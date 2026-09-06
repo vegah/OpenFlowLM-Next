@@ -14,28 +14,36 @@
 namespace open_qwen36 {
 
 namespace fs = std::filesystem;
-using namespace layout;
 
 std::string Engine::find_kernels(const LM_Config& config) {
-    auto complete = [](const fs::path& dir) {
+    // A kernel set is a manifest.json plus every xclbin / insts.bin it names.
+    auto complete = [](const fs::path& dir, std::string* why) {
         std::error_code ec;
-        for (const char* d : {"lx0", "lx1", "ax0", "ax1", "ln", "lm_head_q8"})
-            if (!fs::is_regular_file(dir / d / "final.xclbin", ec) || !fs::is_regular_file(dir / d / "insts.bin", ec)) return false;
+        if (!fs::is_regular_file(dir / "manifest.json", ec)) { *why = "no manifest.json"; return false; }
+        try {
+            Manifest m = Manifest::load((dir / "manifest.json").string());
+            for (const auto& f : m.files())
+                if (!fs::is_regular_file(dir / f, ec)) { *why = "manifest names missing " + f; return false; }
+        } catch (const std::exception& e) {
+            *why = e.what();
+            return false;
+        }
         return true;
     };
+    std::string why;
     if (const char* env = std::getenv("FLM_OPEN_KERNELS_DIR")) {
-        if (complete(env)) return env;
-        std::fprintf(stderr, "open_qwen36: FLM_OPEN_KERNELS_DIR=%s lacks the six kernel pairs\n", env);
+        if (complete(env, &why)) return env;
+        std::fprintf(stderr, "open_qwen36: FLM_OPEN_KERNELS_DIR=%s is not a kernel set: %s\n", env, why.c_str());
     }
     fs::path local = fs::path(config.model_path) / "open_kernels";
-    if (complete(local)) return local.string();
+    if (complete(local, &why)) return local.string();
     std::string prefix = config.exec_path;
     if (prefix.empty()) {
         try { prefix = utils::find_xclbin_path(); } catch (const std::exception&) { prefix.clear(); }
     }
     if (!prefix.empty()) {
         fs::path cand = fs::path(prefix) / "xclbins" / config.model_name / "open_kernels";
-        if (complete(cand)) return cand.string();
+        if (complete(cand, &why)) return cand.string();
     }
     return {};
 }
@@ -50,7 +58,7 @@ Engine::Engine(const LM_Config& config, flm_rt::device* dev, int MAX_L) : dev_(d
     if (const char* tm = std::getenv("FLM_OPEN_TIMEOUT_MS")) cfg_.timeout_ms = static_cast<unsigned>(std::strtoul(tm, nullptr, 10));
     cfg_.verbose = std::getenv("FLM_OPEN_QUIET") == nullptr;
     core_ = std::make_unique<Core>(cfg_, dev_);
-    logits_.assign(VOCAB, bf16(0.f));
+    logits_.assign(core_->vocab(), bf16(0.f));
 }
 
 Engine::~Engine() = default;
@@ -64,9 +72,10 @@ void Engine::load_open_weights() {
 
 buffer<bf16> Engine::logits_view() {
     const std::vector<float>& lg = core_->logits();
-    for (size_t i = 0; i < REAL_VOCAB; ++i) logits_[i] = bf16(lg[i]);
+    const size_t real = core_->real_vocab(), vocab = core_->vocab();
+    for (size_t i = 0; i < real; ++i) logits_[i] = bf16(lg[i]);
     // lm_head rows past the tokenizer's vocab are padding with undefined content
-    for (size_t i = REAL_VOCAB; i < VOCAB; ++i) logits_[i] = bf16(-std::numeric_limits<float>::infinity());
+    for (size_t i = real; i < vocab; ++i) logits_[i] = bf16(-std::numeric_limits<float>::infinity());
     return buffer<bf16>(logits_.data(), logits_.size());
 }
 
@@ -113,14 +122,14 @@ void Engine::clear_context() {
 }
 
 buffer<bf16> Engine::get_k_cache(int layer_idx, int idx) {
-    buffer<bf16> out(512);
+    buffer<bf16> out(core_->manifest().kv_row / 4);   // one K row: bf16[kv heads x head dim]
     if (!core_->is_attention_layer(layer_idx)) return out;
     core_->kv_row(layer_idx, idx, false, reinterpret_cast<uint16_t*>(out.data()));
     return out;
 }
 
 buffer<bf16> Engine::get_v_cache(int layer_idx, int idx) {
-    buffer<bf16> out(512);
+    buffer<bf16> out(core_->manifest().kv_row / 4);
     if (!core_->is_attention_layer(layer_idx)) return out;
     core_->kv_row(layer_idx, idx, true, reinterpret_cast<uint16_t*>(out.data()));
     return out;
