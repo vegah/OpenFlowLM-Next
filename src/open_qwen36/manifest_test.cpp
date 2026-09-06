@@ -4,6 +4,7 @@
 ///        No XRT, no hardware: `manifest_test <fixtures/manifest_qwen36.json>`.
 // Traces: OPEN-MANIFEST (canonical spec: specs/open-engine/spec.md)
 #include <cstdio>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 
@@ -25,6 +26,21 @@ void check(bool ok, const std::string& what) {
 void refused(const Manifest& m, const json& cfg, const std::string& needle, const std::string& what) {
     try {
         m.check_model(cfg, "test");
+        check(false, what + " (accepted)");
+    } catch (const std::runtime_error& e) {
+        std::string msg = e.what();
+        check(msg.find(needle) != std::string::npos, what + ": " + msg);
+    }
+}
+
+/// Expects Manifest::parse to throw with `needle` after `edit` breaks the manifest at `path`.
+template <class Edit>
+void refused_manifest(const char* path, const std::string& needle, const std::string& what, Edit edit) {
+    std::ifstream f(path);
+    json j = json::parse(f);
+    edit(j);
+    try {
+        Manifest::parse(j, "edited");
         check(false, what + " (accepted)");
     } catch (const std::runtime_error& e) {
         std::string msg = e.what();
@@ -119,6 +135,17 @@ int main(int argc, char** argv) {
     } catch (const std::runtime_error& e) {
         check(std::string(e.what()).find("manifest_version 2") != std::string::npos, std::string("manifest_version 2 is refused: ") + e.what());
     }
+    // A pack op missing a size pools::apply needs, and a moeroute2 step on a kernel
+    // without the routed-expert table: both named at load, not part-way through a run.
+    refused_manifest(argv[1], "nch", "a std_perm without nch is refused at load", [](json& j) {
+        for (auto& lt : j["layer_types"])
+            for (auto& o : lt["pack"]["pool"])
+                if (o["op"] == "std_perm") o.erase("nch");
+    });
+    refused_manifest(argv[1], "chunk_bytes", "an lm_head op without chunk_bytes is refused at load",
+                     [](json& j) { j["pack"]["lm_head"]["ops"][0].erase("chunk_bytes"); });
+    refused_manifest(argv[1], "moeroute2 on kernel", "a moeroute2 step on an unpatched kernel is refused at load",
+                     [](json& j) { j["kernels"]["lx1"].erase("patch"); });
     // ---- the dense family's manifest: no MoE geometry, one run per layer, a q4 head
     if (argc >= 3) {
         Manifest d;

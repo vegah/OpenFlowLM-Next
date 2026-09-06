@@ -45,17 +45,26 @@ def main() -> int:
     a = ap.parse_args()
 
     tk = Tokenizer.from_file(str(Path(a.model) / "tokenizer.json"))
+
+    def ids_of(*names):
+        """The named tokens' ids; a family whose tokenizer lacks one would run past EOS."""
+        got = {n: tk.token_to_id(n) for n in names}
+        missing = [n for n, i in got.items() if i is None]
+        if missing:
+            raise SystemExit(f"tokenizer lacks {missing}")
+        return [got[n] for n in names]
+
     if tk.token_to_id("<start_of_turn>") is not None:
         # Gemma: <bos><start_of_turn>user\n...<end_of_turn>\n<start_of_turn>model\n
         prompt = f"<bos><start_of_turn>user\n{a.message}<end_of_turn>\n<start_of_turn>model\n"
         ids = tk.encode(prompt, add_special_tokens=False).ids
-        IM_END, EOT = tk.token_to_id("<end_of_turn>"), tk.token_to_id("<eos>")
+        IM_END, EOT = ids_of("<end_of_turn>", "<eos>")
     elif tk.token_to_id("<|start_header_id|>") is not None:
         # Llama 3: <|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n...<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n
         prompt = (f"<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{a.message}<|eot_id|>"
                   f"<|start_header_id|>assistant<|end_header_id|>\n\n")
         ids = tk.encode(prompt, add_special_tokens=False).ids
-        IM_END, EOT = tk.token_to_id("<|eot_id|>"), tk.token_to_id("<|end_of_text|>")
+        IM_END, EOT = ids_of("<|eot_id|>", "<|end_of_text|>")
     else:
         prompt = f"<|im_start|>user\n{a.message}<|im_end|>\n<|im_start|>assistant\n"
         IM_START, IM_END, EOT, THINK, END_THINK, NL, NLNL = special_ids(tk)

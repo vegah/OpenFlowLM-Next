@@ -3,7 +3,9 @@
 #include "open_qwen36/manifest.hpp"
 
 #include <fstream>
+#include <initializer_list>
 #include <stdexcept>
+#include <utility>
 
 namespace open_qwen36 {
 
@@ -48,6 +50,12 @@ PackOp parse_op(const json& j, const std::string& where) {
     p.groups = j.value("groups", 0ull);
     p.width = j.value("width", 0ull);
     p.chunk_bytes = j.value("chunk_bytes", 0ull);
+    // The same fields pools::apply needs, checked here so a bad manifest is named
+    // at load rather than surfacing as a "pools:" error part-way through packing.
+    auto need_all = [&](std::initializer_list<std::pair<const char*, uint64_t>> fs) {
+        for (const auto& [name, v] : fs)
+            if (v == 0) fail(where, p.op + " " + (p.tensor.empty() ? p.up : p.tensor) + " without " + name);
+    };
     if (p.op == "std_perm" || p.op == "put" || p.op == "expert_down" || p.op == "conv_transpose" || p.op == "lmhead_q8") {
         if (p.tensor.empty()) fail(where, p.op + " without a tensor");
     } else if (p.op == "expert_stripes") {
@@ -55,6 +63,12 @@ PackOp parse_op(const json& j, const std::string& where) {
     } else {
         fail(where, "unknown pack op '" + p.op + "'");
     }
+    if (p.op == "std_perm") need_all({{"nch", p.nch}, {"in_dim", p.in_dim}});
+    else if (p.op == "expert_stripes") need_all({{"stripe_bytes", p.stripe_bytes}, {"stripes", p.stripes}, {"experts", p.experts}, {"in_dim", p.in_dim}});
+    else if (p.op == "expert_down") need_all({{"expert_bytes", p.expert_bytes}, {"experts", p.experts}});
+    else if (p.op == "put") need_all({{"cap", p.cap}});
+    else if (p.op == "lmhead_q8") need_all({{"chunk_bytes", p.chunk_bytes}});
+    else if (p.op == "conv_transpose") need_all({{"taps", p.taps}, {"groups", p.groups}, {"width", p.width}});
     return p;
 }
 
@@ -76,6 +90,16 @@ std::vector<Step> parse_program(const json& j, const std::string& where) {
         out.push_back(std::move(st));
     }
     return out;
+}
+
+/// A program step names a kernel this manifest declares, and a moeroute2 step names
+/// one built with the routed-expert patch table (Core::route needs it).
+void check_step(const Manifest& m, const Step& s, const std::string& where, const char* what) {
+    auto it = m.kernels.find(s.kernel);
+    if (it == m.kernels.end()) fail(where, std::string(what) + " names unknown kernel " + s.kernel);
+    if (s.op == "moeroute2" && it->second.patch != "moeroute2")
+        fail(where, std::string(what) + ": moeroute2 on kernel " + s.kernel + ", whose patch is '" +
+                        (it->second.patch.empty() ? std::string("none") : it->second.patch) + "'");
 }
 
 }  // namespace
@@ -158,8 +182,7 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
         else if (t.state_kind == "kv") t.state_row = get<uint64_t>(st, "row", tw);
         else fail(tw, "unknown state kind " + t.state_kind);
         t.program = parse_program(need(v, "program", tw), tw);
-        for (const auto& s : t.program)
-            if (!m.kernels.count(s.kernel)) fail(tw, "program names unknown kernel " + s.kernel);
+        for (const auto& s : t.program) check_step(m, s, tw, "program");
         const json& pk = need(v, "pack", tw);
         for (const auto& o : need(pk, "pool", tw)) t.pool.push_back(parse_op(o, tw + " pack.pool"));
         for (const auto& o : need(pk, "consts", tw)) t.consts.push_back(parse_op(o, tw + " pack.consts"));
@@ -168,8 +191,7 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
     for (const auto& l : m.layers)
         if (!m.layer_types.count(l)) fail(where, "layers names unknown layer type " + l);
     m.tail = parse_program(need(j, "tail", where), where + " tail");
-    for (const auto& s : m.tail)
-        if (!m.kernels.count(s.kernel)) fail(where, "tail names unknown kernel " + s.kernel);
+    for (const auto& s : m.tail) check_step(m, s, where, "tail");
     for (const auto& [k, v] : need(j, "globals", where).items()) {
         if (v.is_number()) {
             m.globals[k] = v.get<uint64_t>();
