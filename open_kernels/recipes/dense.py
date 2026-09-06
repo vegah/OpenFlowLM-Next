@@ -78,7 +78,7 @@ class DenseRecipe:
 
 def _check(spec: ModelSpec) -> None:
     n = LIMITS["n_cols"]
-    if spec.family not in ("qwen3", "llama3", "gemma3"):
+    if spec.family not in ("qwen3", "llama3", "gemma3", "granite"):
         raise OpRangeError(f"dense recipe given a {spec.family!r} spec")
     if spec.activation not in ("silu", "gelu_tanh"):
         raise OpRangeError(f"dense: activation {spec.activation!r} (silu | gelu_tanh)")
@@ -289,10 +289,18 @@ def hf_config_check(spec: ModelSpec) -> dict:
     d = {"hidden_size": spec.hidden, "num_hidden_layers": spec.num_layers, "vocab_size": spec.vocab,
          "num_attention_heads": spec.num_heads, "num_key_value_heads": spec.num_kv_heads,
          "intermediate_size": spec.intermediate}
-    if spec.family in ("qwen3", "gemma3"):
+    if spec.family in ("qwen3", "gemma3", "granite"):
         d["head_dim"] = spec.head_dim          # Llama configs may omit it (hidden / heads)
     if spec.family == "gemma3":
         d["sliding_window"] = spec.sliding_window
+    if spec.family == "granite":
+        # The engine refuses an UNFOLDED container at load, not just at spec
+        # derivation: Granite's attention_multiplier replaces 1/sqrt(HD), and
+        # attn.h hard-codes the latter. A folded config reads head_dim**-0.5
+        # exactly (0.125 at hd 64, a power of two). Swapping an unfolded
+        # model.q4nx under a built kernel set would otherwise run and return
+        # plausible garbage. See spec.py's _granite_scale_check.
+        d["attention_multiplier"] = spec.head_dim ** -0.5
     return d
 
 
