@@ -192,23 +192,24 @@ std::string find_artifacts(const std::filesystem::path& dir, const json& info) {
     const fs::path local = dir / "npue_designs";
     if (has_design(local)) return local.string();
 
-    std::string prefix;
-    try {
-        prefix = utils::find_xclbin_path();
-    } catch (const std::exception&) {
-        prefix.clear();
-    }
-    if (!prefix.empty() && info.contains("npue_design_family") &&
-        info["npue_design_family"].is_string()) {
-        const fs::path cand = fs::path(prefix) / "xclbins" /
-                              info["npue_design_family"].get<std::string>();
-        if (has_design(cand)) return cand.string();
+    // Every xclbins root, checked for a COMPLETE set (#30). The unit here is a
+    // family that several models share and that is built rather than downloaded,
+    // so one family built into the user directory while the rest stay in the
+    // install tree is the expected state, not an edge case -- and the first root
+    // with an xclbins/ at all would only ever see one of the two. Install tree
+    // first: a user directory adds families, it does not replace shipped ones.
+    if (info.contains("npue_design_family") && info["npue_design_family"].is_string()) {
+        const std::string family = info["npue_design_family"].get<std::string>();
+        for (const std::string& root : utils::xclbin_roots_install_first()) {
+            const fs::path cand = fs::path(root) / "xclbins" / family;
+            if (has_design(cand)) return cand.string();
+        }
     }
     throw std::runtime_error(
         "NpueEmbedding: no design set for this model.\n"
         "Looked for " + local.string() + "/gemm_rtp/design.json and, if the "
-        "model entry names \"npue_design_family\", for that family under the "
-        "installed xclbin tree.\n"
+        "model entry names \"npue_design_family\", for that family under every "
+        "xclbins root (utils::xclbin_roots_install_first()).\n"
         "A design set is four instruction streams over one xclbin, compiled "
         "for this model's GEMM geometry -- one set serves every model whose "
         "shapes match, which is why it is keyed by geometry rather than by "

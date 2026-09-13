@@ -135,6 +135,8 @@ bool ModelDownloader::pull_model(const std::string& model_tag, bool use_modelsco
         header_print("OFLM", "Pulling model from " + model_server + "...");
         header_print("OFLM", "Model: " + new_model_tag);
         header_print("OFLM", "Name: " + model_name);
+        // Which store: a complete copy may be in a pre-rename directory (#30).
+        header_print("OFLM", "Path: " + supported_models.get_model_path(new_model_tag));
 
         ModelDownloader::ModelStatus status = is_model_downloaded(new_model_tag);
         switch (status) {

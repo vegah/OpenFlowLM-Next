@@ -9,6 +9,8 @@
 #include <fstream>
 #include <limits>
 #include <sstream>
+#include <string>
+#include <vector>
 
 #include "nlohmann/json.hpp"
 #include "tokenizers_cpp.h"
@@ -22,7 +24,7 @@
 // this one resolver. Both the oflm target and the standalone test link
 // common/utils.cpp.
 namespace utils {
-std::string find_xclbin_path();
+std::vector<std::string> xclbin_roots_install_first();
 }
 
 namespace open_embedding {
@@ -139,20 +141,16 @@ std::string Engine::pick_npu_asset_dir() const {
         return local.string();
     }
 
-    // find_xclbin_path() throws when no xclbin tree is installed. The open
-    // engine must not hard-require one: no kernels simply means CPU-only.
-    std::string prefix;
-    try {
-        prefix = utils::find_xclbin_path();
-    } catch (const std::exception&) {
-        prefix.clear();
-    }
-    if (!prefix.empty()) {
+    // Every xclbins root, not only the first one with an xclbins/ at all (#30):
+    // a family set in the user directory and one shipped in the install tree
+    // must both be reachable, the install tree first. No root at all simply
+    // means CPU-only -- the open engine must not hard-require an xclbin tree.
+    for (const std::string& root : utils::xclbin_roots_install_first()) {
         for (const char* family : {"Embedding-Gemma-300M-OpenNPU2", "embed-gemma"}) {
-            const fs::path cand = fs::path(prefix) / "xclbins" / family / "npu_matmul_f32";
+            const fs::path cand = fs::path(root) / "xclbins" / family / "npu_matmul_f32";
             if (has_kernels(cand)) {
                 std::fprintf(stderr, "open_embedding: using app family NPU kernels (%s)\n",
-                             family);
+                             cand.string().c_str());
                 return cand.string();
             }
         }

@@ -13,7 +13,9 @@
 #include <any>
 #include <unordered_set>
 #include <filesystem>
+#include <map>
 #include "utils/utils.hpp"
+#include "model_registry.hpp"
 
 /// \note This class is used to manage the model list.
 class model_list {
@@ -23,22 +25,63 @@ class model_list {
         model_list(){}
 
 
-        /// \brief constructor
+        /// \brief constructor: one registry, one models directory
         /// \param list_path the path to the model list
-        /// \param exe_dir the executable directory for resolving relative paths
-        model_list(std::string& list_path, std::string& exe_dir){
-            this->list_path = list_path;
-            std::ifstream config_file(list_path);
+        /// \param exe_dir the directory `model_path` is resolved against
+        model_list(std::string& list_path, std::string& exe_dir)
+            : model_list(std::vector<std::string>{list_path}, exe_dir, std::vector<std::string>{exe_dir}) {}
+
+        /// \brief constructor: a built-in registry merged with the user ones (#30)
+        /// \param list_paths the built-in registry, then user registries oldest first
+        ///        (utils::find_model_lists()); the merge rules are in model_registry.hpp
+        /// \param default_root where a model installed nowhere yet belongs
+        ///        (utils::get_models_directory())
+        /// \param search_roots every directory an installed model may already be in, in
+        ///        order (utils::models_directories()). Searched per model, so a model in
+        ///        the pre-rename directory stays found once the new one exists.
+        model_list(const std::vector<std::string>& list_paths, const std::string& default_root,
+                   const std::vector<std::string>& search_roots) {
+            if (list_paths.empty()) {
+                std::cerr << "No model list to read" << std::endl;
+                exit(1);
+            }
+            this->list_path = list_paths.front();
+            std::ifstream config_file(this->list_path);
             if (!config_file.is_open()) {
-                std::cerr << "Failed to open config file: " << list_path << std::endl;
+                std::cerr << "Failed to open config file: " << this->list_path << std::endl;
                 exit(1);
             }
             this->config = nlohmann::json::parse(config_file);
-            // Resolve model_root_path relative to executable directory
-            std::string relative_model_path = this->config["model_path"];
-            std::filesystem::path root_path = std::filesystem::path(exe_dir) / relative_model_path;
-            this->model_root_path = root_path.string();
             config_file.close();
+            this->builtin_default_sizes = model_registry::default_sizes(this->config);
+
+            std::vector<model_registry::Layer> layers;
+            model_registry::Report report;
+            for (size_t i = 1; i < list_paths.size(); ++i) {
+                try {
+                    std::ifstream f(list_paths[i]);
+                    if (!f.is_open()) throw std::runtime_error("cannot be opened");
+                    layers.push_back({list_paths[i], nlohmann::json::parse(f)});
+                } catch (const std::exception& e) {
+                    // A broken user file must not take the built-in models down with it,
+                    // and must not disappear in silence either.
+                    report.notes.push_back(list_paths[i] + ": could not be read (" + e.what() + "); ignored");
+                }
+            }
+            if (!layers.empty()) this->config = model_registry::merge(std::move(this->config), layers, &report);
+            for (const auto& src : report.sources) {
+                const size_t n = src.tags.size();
+                std::cerr << "[OFLM]  " << n << " user model" << (n == 1 ? "" : "s") << " from " << src.path
+                          << " (" << model_registry::detail::sample(src.tags) << ")" << std::endl;
+            }
+            for (const std::string& n : report.notes) std::cerr << "[OFLM]  " << n << std::endl;
+
+            // Resolve model_root_path relative to the default models directory
+            std::string relative_model_path = this->config["model_path"];
+            this->model_relative_path = relative_model_path;
+            std::filesystem::path root_path = std::filesystem::path(default_root) / relative_model_path;
+            this->model_root_path = root_path.string();
+            this->model_search_roots = search_roots;
 
             // Populate all_tags set
             for (const auto& [model_type, sizes] : this->config["models"].items()) {
@@ -125,7 +168,12 @@ class model_list {
             if (new_tag.find(':') == std::string::npos) {
                 // get the first size in the subset
                 std::string model_type = new_tag;
-                std::string model_size = this->config["models"][model_type].begin().key();
+                // A bare built-in tag keeps meaning what the built-in registry says, however a
+                // user entry under the same type happens to sort (#30).
+                auto builtin = this->builtin_default_sizes.find(model_type);
+                std::string model_size = builtin != this->builtin_default_sizes.end()
+                    ? builtin->second
+                    : this->config["models"][model_type].begin().key();
                 new_tag = model_type + ":" + model_size;
             }
             return new_tag;
@@ -218,7 +266,32 @@ class model_list {
             auto [new_tag_unused, model_info] = this->get_model_info(new_tag);
             std::string model_name = model_info["name"];
             std::filesystem::path full_path = std::filesystem::path(this->model_root_path) / model_name;
+            // Per model, not per directory (#30): the first search root that holds a COMPLETE
+            // copy, so one model pulled into .oflm does not hide every model still in .flm.
+            // Complete, not merely present: this path is also where `oflm pull` writes and what
+            // `oflm remove` deletes, so a partial or abandoned copy in another store must never
+            // become the target -- anything short of complete belongs to the default directory.
+            for (const std::string& root : this->model_search_roots) {
+                const std::filesystem::path cand =
+                    std::filesystem::path(root) / this->model_relative_path / model_name;
+                if (is_complete_copy(cand, model_info)) return cand.string();
+            }
             return full_path.string();
+        }
+
+        /// \brief true when `dir` holds every file the entry lists (#30)
+        /// \note An entry without a `files` list counts as complete when the directory is not
+        ///       empty. Sizes and hashes are the downloader's business, not this lookup's.
+        static bool is_complete_copy(const std::filesystem::path& dir, const nlohmann::json& model_info) {
+            std::error_code ec;
+            if (!std::filesystem::is_directory(dir, ec)) return false;
+            if (model_info.contains("files") && model_info["files"].is_array() && !model_info["files"].empty()) {
+                for (const auto& f : model_info["files"]) {
+                    if (!f.is_string() || !std::filesystem::is_regular_file(dir / f.get<std::string>(), ec)) return false;
+                }
+                return true;
+            }
+            return std::filesystem::directory_iterator(dir, ec) != std::filesystem::directory_iterator();
         }
 
         bool is_model_supported(const std::string& tag) {
@@ -229,5 +302,8 @@ class model_list {
         std::string list_path;
         nlohmann::json config;
         std::string model_root_path;
+        std::string model_relative_path;
+        std::vector<std::string> model_search_roots;
+        std::map<std::string, std::string> builtin_default_sizes;
 
 };

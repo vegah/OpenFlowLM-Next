@@ -7,11 +7,11 @@ loaded from ``config.json`` in that directory.
 
 Because the system registry (``/opt/openflowlm/share/oflm/model_list.json``) is
 root-owned, we never write to it. Instead the converted model is copied into the
-user's models directory and registered in a user-level copy of the registry at
-``~/.config/oflm/model_list.json``. Point ``OFLM_CONFIG_PATH`` at that file so OFLM
-picks it up:
-
-    export OFLM_CONFIG_PATH=$HOME/.config/oflm/model_list.json
+user's models directory and registered in a user-level registry at
+``~/.config/oflm/model_list.json``. OFLM merges that file over its built-in registry
+without being told to (#30), so it holds only the deployed entries. If
+``OFLM_CONFIG_PATH`` names it instead, OFLM reads it as the WHOLE registry, and it is
+seeded with a copy of the system registry so the official models stay listed.
 
 The new entry is derived from the official entry for the source model (same
 ``details.family`` so the same engine is dispatched, same ``size`` for the memlock
@@ -111,11 +111,89 @@ def get_models_root() -> Path:
 
 
 def get_user_registry_path() -> Path:
-    """Where the user-level registry lives. Honors an already-set OFLM_CONFIG_PATH."""
-    env = os.environ.get("OFLM_CONFIG_PATH")
-    if env:
-        return Path(env)
+    """Where the user-level registry lives. Honors an OFLM_CONFIG_PATH naming a custom registry.
+
+    Not one naming the install's built-in list (home_install.sh's oflm_env.sh exports
+    exactly that): that file is not ours to edit, and OFLM merges user registries over it.
+    """
+    env = whole_registry_env()
+    if env is not None:
+        return env
     return get_models_root().parent / "model_list.json"
+
+
+def _engine_env(name: str) -> Optional[str]:
+    """An OFLM_* variable as utils::getenv_oflm reads it: OFLM_X, then FLM_X."""
+    return os.environ.get(name) or os.environ.get(name[1:]) or None
+
+
+def engine_user_directories() -> List[Path]:
+    """utils::user_directories(): the user directories OFLM searches, newest name first."""
+    home = Path.home()
+    if os.name == "nt":
+        return [home / ".oflm", home / ".config" / "oflm", home / ".flm", home / ".config" / "flm"]
+    return [home / ".config" / "oflm", home / ".config" / "flm"]
+
+
+def _same_path(a, b) -> bool:
+    try:
+        return Path(a).resolve() == Path(b).resolve()
+    except OSError:
+        return False
+
+
+def builtin_registry_candidates() -> List[Path]:
+    """Where OFLM's built-in model_list.json may be (utils::builtin_model_list_candidates)."""
+    exe = find_oflm_executable()
+    candidates = []
+    if exe:
+        candidates.append(Path(exe).parent / "model_list.json")
+        candidates.append(Path(exe).parent.parent / "share" / "oflm" / "model_list.json")
+    candidates += [Path(p) for p in _INSTALL_PREFIX_CANDIDATES]
+    return candidates
+
+
+def whole_registry_env() -> Optional[Path]:
+    """OFLM_CONFIG_PATH when OFLM would read it as the WHOLE registry, else None.
+
+    utils::registry_layers(): a variable naming the built-in list itself is not a custom
+    registry, and user registries are merged over it anyway.
+    """
+    env = _engine_env("OFLM_CONFIG_PATH")
+    if not env or any(_same_path(env, c) for c in builtin_registry_candidates()):
+        return None
+    return Path(env)
+
+
+def engine_merges_registry(path: Path) -> bool:
+    """True when OFLM merges ``path`` over its built-in registry on its own (#30).
+
+    utils::find_model_lists(): every ``<user dir>/model_list.json``, unless
+    OFLM_CONFIG_PATH names a custom registry. A variable naming a missing file is
+    ignored by OFLM -- except that ``path`` is about to be written, so naming it counts.
+    """
+    env = whole_registry_env()
+    if env is not None and (env.is_file() or _same_path(env, path)):
+        return False
+    return any(_same_path(d / "model_list.json", path) for d in engine_user_directories())
+
+
+def engine_reads_registry(path: Path) -> bool:
+    """True when OFLM reads ``path`` at all: merged, or named by OFLM_CONFIG_PATH."""
+    env = whole_registry_env()
+    return engine_merges_registry(path) or (env is not None and _same_path(env, path))
+
+
+def engine_searches_xclbin_root(root: Path) -> bool:
+    """True when utils::xclbin_roots() includes ``root`` (it is searched per model name)."""
+    known = list(engine_user_directories())
+    env = _engine_env("OFLM_XCLBIN_PATH")
+    if env:
+        known.append(Path(env).parent if Path(env).name == "xclbins" else Path(env))
+    config = whole_registry_env()
+    if config is not None:
+        known.append(config.parent)
+    return any(_same_path(k, root) for k in known)
 
 
 def find_system_xclbin_root() -> Optional[Path]:
@@ -273,7 +351,13 @@ def register_model(tag: str, entry: dict, user_registry_path: Path, system_list:
     if user_registry_path.is_file():
         with open(user_registry_path, encoding="utf-8") as f:
             registry = json.load(f)
+    elif engine_merges_registry(user_registry_path):
+        # Merged over the built-in registry (#30): only what was deployed. A copy of
+        # the built-in entries would go stale the day OFLM ships a new model.
+        registry = {"model_path": "models", "models": {}}
     else:
+        # Read only as the WHOLE registry (through OFLM_CONFIG_PATH): it needs the
+        # official entries too, or they disappear from `oflm list`.
         with open(system_list, encoding="utf-8") as f:
             registry = json.load(f)
     models = registry.setdefault("models", {})
@@ -336,22 +420,22 @@ def deploy_model(
         print(f"[INFO] Registry defaults copied from official entry: {src_tag}")
     else:
         print("[WARN] No official registry entry found; wrote a minimal entry (family/size guesses).")
-    if os.environ.get("OFLM_CONFIG_PATH") != str(user_registry):
+    if not engine_reads_registry(user_registry):
         print(f"[INFO] OFLM does not read this registry yet. Add to your shell rc:\n"
               f"        export OFLM_CONFIG_PATH={user_registry}")
     else:
-        print(f"[INFO] OFLM_CONFIG_PATH already points at this registry. Ready to 'oflm run {tag}'.")
+        print(f"[INFO] OFLM reads this registry. Ready to 'oflm run {tag}'.")
 
     source_dir_name = base_entry.get("name") if base_entry else None
     if source_dir_name:
         user_xclbin_root = link_model_xclbins(model_dir_name, source_dir_name)
         if user_xclbin_root is not None:
             print(f"[INFO] Linked xclbins for '{model_dir_name}' -> '{source_dir_name}'")
-            if os.environ.get("OFLM_XCLBIN_PATH") != str(user_xclbin_root.parent):
+            if not engine_searches_xclbin_root(user_xclbin_root.parent):
                 print(f"[INFO] The runtime needs to find these xclbins. Add to your shell rc:\n"
                       f"        export OFLM_XCLBIN_PATH={user_xclbin_root.parent}")
             else:
-                print("[INFO] OFLM_XCLBIN_PATH already points at the user xclbin tree.")
+                print("[INFO] OFLM searches this xclbin tree.")
 
     return {
         "tag": tag,

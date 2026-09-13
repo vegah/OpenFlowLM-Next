@@ -1211,6 +1211,42 @@ endif()
 add_test(NAME openai_compat
          COMMAND openai_compat_test "${CMAKE_CURRENT_SOURCE_DIR}/model_list.json")
 
+# user_dirs: where the application looks for registries, installed models and
+# kernel roots across the .oflm and pre-rename .flm user directories (#30), and
+# how the built-in and user registries merge. NO device, NO weights, NO network:
+# it builds its directory trees under the system temp directory and calls the
+# same utils.cpp functions oflm does. Every defect it guards is a well-formed
+# wrong answer -- fewer models listed, a model pulled again, a kernel root that
+# does not hold the model -- so the smoke test cannot see any of them.
+add_executable(user_dirs_test common/user_dirs_test.cpp common/utils.cpp)
+if(NOT WIN32)
+    target_compile_options(user_dirs_test PRIVATE -mavx -mavx2)
+endif()
+target_include_directories(user_dirs_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include")
+# Same reason openai_compat_test needs these: model_list.hpp -> utils/utils.hpp ->
+# device_runtime.hpp, so the NPU RUNTIME HEADERS are needed to compile.
+if(OFLM_USE_HRX)
+    target_compile_definitions(user_dirs_test PRIVATE OFLM_USE_HRX=1)
+    target_link_libraries(user_dirs_test PRIVATE hrx::hrx)
+elseif(XRT_INCLUDE_DIRS)
+    target_include_directories(user_dirs_test PRIVATE ${XRT_INCLUDE_DIRS})
+elseif(XRT_INCLUDE_DIR)
+    target_include_directories(user_dirs_test PRIVATE ${XRT_INCLUDE_DIR})
+endif()
+target_compile_definitions(user_dirs_test PRIVATE
+    DISABLE_ABI_CHECK=1
+    CMAKE_INSTALL_PREFIX="${CMAKE_INSTALL_PREFIX}"
+    CMAKE_XCLBIN_PREFIX="${CMAKE_XCLBIN_PREFIX}")
+if(MSVC)
+    target_compile_options(user_dirs_test PRIVATE /EHsc /Zc:__cplusplus /bigobj)
+    target_compile_definitions(user_dirs_test PRIVATE
+        _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_DEPRECATE NOMINMAX WIN32_LEAN_AND_MEAN __WINDOWS__)
+    target_link_libraries(user_dirs_test PRIVATE shell32)
+endif()
+add_test(NAME user_dirs COMMAND user_dirs_test)
+
 # ———————————————————————————————————————————————
 # Packaging (CPack): produce an installable, full-distribution package.
 #   cmake --build --preset linux-package-rpm   # or -deb / -tgz

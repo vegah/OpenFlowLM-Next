@@ -478,21 +478,22 @@ int main(int argc, char* argv[]) {
     
     // Get the command, model tag, and force flag
     std::string exe_dir = utils::get_executable_directory();
-    std::string config_path;
+    // The built-in registry plus the user-level ones, merged (#30) -- or exactly
+    // $OFLM_CONFIG_PATH when that is set.
+    std::vector<std::string> config_paths;
     try {
-        config_path = utils::find_model_list();
-        // header_print("OFLM", "Fetching models from: " + config_path);
+        config_paths = utils::find_model_lists();
     }
     catch (const std::exception& e) {
         std::cerr << e.what() << std::endl;
         return 1;
     }
 
-    // Get the models directory from environment variable or default
+    // Where a model goes if it is installed nowhere yet, and every directory an
+    // installed one may already be in.
     std::string models_dir = utils::get_models_directory();
 
-    
-    model_list availble_models(config_path, models_dir);
+    model_list availble_models(config_paths, models_dir, utils::models_directories());
     
     // Extract parsed values
     bool got_power_mode = (parsed_args.power_mode != "performance"); // Check if user explicitly set power mode

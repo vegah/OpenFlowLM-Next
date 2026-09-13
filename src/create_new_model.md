@@ -289,9 +289,12 @@ Field notes:
 - `oflm_min_version` — refuses to load on older OFLM builds.
 - `footprint` — GiB of memory reported to the user for model-fits checks.
 
-Model resolution at runtime:
-`get_models_directory()` = `$OFLM_MODEL_PATH` or `~/oflm`;
-`get_model_path(tag)` = `<models_dir>/<model_path>/<name>`.
+Model resolution at runtime (`specs/user-directory/spec.md`):
+the registry is the built-in `model_list.json` with every user-level one merged over it
+(or exactly `$OFLM_CONFIG_PATH` when set); `get_model_path(tag)` =
+`<root>/<model_path>/<name>` for the first root in `utils::models_directories()`
+(`$OFLM_MODEL_PATH`, or the `.oflm`/`.flm` user directories) that holds it, else under
+`get_models_directory()`.
 
 ---
 
