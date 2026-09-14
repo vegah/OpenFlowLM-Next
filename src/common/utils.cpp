@@ -85,6 +85,20 @@ std::vector<std::string> user_directories() {
     return user_directories(get_user_directory());
 }
 
+std::vector<std::string> registry_directories(const std::string& explicit_model_path, const std::string& user_dir) {
+    std::vector<std::string> v;
+    // `oflm add` writes model_list.json and model_info.json into the models directory,
+    // which is an explicit OFLM_MODEL_PATH when one is set -- a place the user
+    // directories below do not cover. It is the newest, so it goes first.
+    if (!explicit_model_path.empty()) v.push_back(explicit_model_path);
+    for (const std::string& d : user_directories(user_dir)) v.push_back(d);
+    return v;
+}
+
+std::vector<std::string> registry_directories() {
+    return registry_directories(getenv_oflm("OFLM_MODEL_PATH"), get_user_directory());
+}
+
 std::string find_model_list() {
     // 1. Check OFLM_CONFIG_PATH environment variable
     const std::string env_path = getenv_oflm("OFLM_CONFIG_PATH");
@@ -97,24 +111,29 @@ std::string find_model_list() {
     return find_builtin_model_list();
 }
 
-std::vector<std::string> model_list_layers(const std::string& builtin_path,
-                                           const std::vector<std::string>& user_dirs) {
+std::vector<std::string> registry_file_layers(const std::string& filename, const std::string& builtin_path,
+                                              const std::vector<std::string>& dirs) {
     namespace fs = std::filesystem;
     std::vector<std::string> layers{builtin_path};
-    // user_dirs is newest first; a merge lets the LATER layer win, so the newest
-    // file has to be applied last.
-    for (auto it = user_dirs.rbegin(); it != user_dirs.rend(); ++it) {
-        const fs::path cand = fs::path(*it) / "model_list.json";
+    // dirs is newest first; a merge lets the LATER layer win, so the newest file has
+    // to be applied last.
+    for (auto it = dirs.rbegin(); it != dirs.rend(); ++it) {
+        const fs::path cand = fs::path(*it) / filename;
         std::error_code ec;
         if (!fs::is_regular_file(cand, ec)) continue;
         bool seen = false;
         for (const std::string& l : layers) {
             std::error_code eq;
-            if (fs::equivalent(l, cand, eq)) { seen = true; break; }
+            if (!l.empty() && fs::equivalent(l, cand, eq)) { seen = true; break; }
         }
         if (!seen) layers.push_back(cand.string());
     }
     return layers;
+}
+
+std::vector<std::string> model_list_layers(const std::string& builtin_path,
+                                           const std::vector<std::string>& user_dirs) {
+    return registry_file_layers("model_list.json", builtin_path, user_dirs);
 }
 
 std::vector<std::string> registry_layers(const std::string& explicit_path, const std::string& builtin_path,
@@ -148,7 +167,7 @@ std::vector<std::string> find_model_lists() {
     if (env_path.empty() && builtin.empty()) {
         throw std::runtime_error("model_list.json not found. Please set OFLM_CONFIG_PATH or place it next to the executable.");
     }
-    std::vector<std::string> layers = registry_layers(env_path, builtin, user_directories());
+    std::vector<std::string> layers = registry_layers(env_path, builtin, registry_directories());
     if (!env_path.empty()) {
         if (layers.size() == 1 && layers[0] == env_path) {
             std::cerr << "[OFLM]  Using custom model list path: " << env_path << std::endl;
@@ -170,28 +189,38 @@ std::vector<std::string> builtin_model_list_candidates(const std::string& exe_di
     };
 }
 
-std::string first_builtin_model_list(const std::vector<std::string>& candidates,
-                                     const std::vector<std::string>& user_dirs) {
+namespace {
+
+/// The first candidate that exists and is not <dir>/<filename> for any registry directory.
+std::string first_non_user_file(const std::vector<std::string>& candidates, const std::string& filename,
+                                const std::vector<std::string>& dirs) {
     namespace fs = std::filesystem;
     for (const std::string& cand : candidates) {
         std::error_code ec;
-        if (!fs::is_regular_file(cand, ec)) continue;
-        // A user registry is never the base (#30). The CWD candidate makes this
-        // reachable: `cd ~/.config/oflm && oflm list` would otherwise read a user file
-        // that holds only what oflm-add added, and lose every built-in model.
+        if (cand.empty() || !fs::is_regular_file(cand, ec)) continue;
         bool user_file = false;
-        for (const std::string& d : user_dirs) {
+        for (const std::string& d : dirs) {
             std::error_code eq;
-            if (fs::equivalent(cand, fs::path(d) / "model_list.json", eq)) { user_file = true; break; }
+            if (fs::equivalent(cand, fs::path(d) / filename, eq)) { user_file = true; break; }
         }
         if (!user_file) return cand;
     }
     return std::string();
 }
 
+} // namespace
+
+std::string first_builtin_model_list(const std::vector<std::string>& candidates,
+                                     const std::vector<std::string>& user_dirs) {
+    // A user registry is never the base (#30). The CWD candidate makes this reachable:
+    // `cd ~/.config/oflm && oflm list` would otherwise read a user file that holds only
+    // what was added, and lose every built-in model.
+    return first_non_user_file(candidates, "model_list.json", user_dirs);
+}
+
 std::string find_builtin_model_list() {
     const std::string found = first_builtin_model_list(
-        builtin_model_list_candidates(get_executable_directory(), CMAKE_INSTALL_PREFIX), user_directories());
+        builtin_model_list_candidates(get_executable_directory(), CMAKE_INSTALL_PREFIX), registry_directories());
     if (found.empty()) {
         throw std::runtime_error("model_list.json not found. Please set OFLM_CONFIG_PATH or place it next to the executable.");
     }
@@ -244,6 +273,36 @@ std::vector<std::string> model_info_candidates(const std::string& exe_dir, const
     };
 }
 
+std::vector<std::string> find_model_infos() {
+    namespace fs = std::filesystem;
+    // An explicit OFLM_MODELINFO_PATH is the whole file, as it is for find_model_info().
+    const std::string env_path = getenv_oflm("OFLM_MODELINFO_PATH");
+    if (!env_path.empty() && fs::exists(env_path)) return {env_path};
+
+    // The shipped file: beside OFLM_CONFIG_PATH (a relocated install points that at its
+    // own share/oflm), then the installed locations -- but never a user registry's
+    // model_info.json, which is a layer below and holds only what was added.
+    std::vector<std::string> candidates;
+    const std::string config_path = getenv_oflm("OFLM_CONFIG_PATH");
+    if (!config_path.empty()) {
+        candidates.push_back((fs::path(config_path).parent_path() / "model_info.json").string());
+    }
+    for (const std::string& c : model_info_candidates(get_executable_directory(), CMAKE_INSTALL_PREFIX)) {
+        candidates.push_back(c);
+    }
+    const std::vector<std::string> dirs = registry_directories();
+    const std::string builtin = first_non_user_file(candidates, "model_info.json", dirs);
+
+    // `oflm add` writes a model_info.json beside the user registry it writes; without
+    // this, a model it added is found in the merged model list and then missing from
+    // the file verification that reads model_info.json by tag.
+    std::vector<std::string> layers = registry_file_layers("model_info.json", builtin, dirs);
+    if (builtin.empty() && layers.size() == 1) {
+        throw std::runtime_error("model_info.json not found. Please set OFLM_MODELINFO_PATH or place it next to the executable.");
+    }
+    return layers;
+}
+
 namespace {
 
 /// A configured root may be given with or without its trailing "xclbins"
@@ -272,17 +331,6 @@ std::vector<std::string> closed_path_roots() {
 
 } // namespace
 
-static std::vector<std::string> existing_xclbin_roots(const std::vector<std::string>& candidates) {
-    std::vector<std::string> roots;
-    for (const std::string& c : candidates) {
-        if (c.empty()) continue;
-        std::error_code ec;
-        if (!std::filesystem::exists(c + "/xclbins", ec)) continue;
-        if (std::find(roots.begin(), roots.end(), c) == roots.end()) roots.push_back(c);
-    }
-    return roots;
-}
-
 std::vector<std::string> xclbin_roots() {
     std::vector<std::string> candidates;
 
@@ -301,38 +349,23 @@ std::vector<std::string> xclbin_roots() {
     // before legacy (#30) -- an existing install keeps working with no
     // migration and no copying of multi-gigabyte weights.
     //
-    // This used to be two lines, the second user_flm_directory(), i.e. the LEGACY root,
-    // and the oflm rename turned it into user_oflm_directory() -- a strict subset of the
-    // list above it. The line became dead and the legacy root stopped being searched,
-    // while the comment went on promising it (#41). user_directories() is one list that
-    // holds both, so the two halves cannot drift apart again.
+    // The second line used to be user_flm_directory(), i.e. the LEGACY root, and the
+    // oflm rename turned it into user_oflm_directory() -- a strict subset of the list
+    // above it. The line became dead and the legacy root stopped being searched, while
+    // the comment went on promising it. legacy_flm_directories() restores what the
+    // comment says (#41).
     for (const std::string& d : user_directories()) candidates.push_back(d);
 
     for (const std::string& c : closed_path_roots()) candidates.push_back(c);
 
-    return existing_xclbin_roots(candidates);
-}
-
-std::vector<std::string> xclbin_search_order(const std::vector<std::string>& install_roots,
-                                             const std::string& config_dir,
-                                             const std::vector<std::string>& user_dirs) {
-    std::vector<std::string> order = install_roots;
-    if (!config_dir.empty()) order.push_back(config_dir);
-    for (const std::string& d : user_dirs) order.push_back(d);
-    return order;
-}
-
-std::vector<std::string> xclbin_roots_install_first() {
-    // The install tree before the user directories, the way a user registry cannot
-    // replace a built-in model: q4nx-build symlinks EVERY official xclbins/<name> into
-    // ~/.config/oflm/xclbins, so a user root searched first would make a second install
-    // or a dev build load the first install's kernels in silence. $OFLM_XCLBIN_PATH is
-    // still first -- closed_path_roots() starts with it.
-    const std::string config_path = getenv_oflm("OFLM_CONFIG_PATH");
-    return existing_xclbin_roots(xclbin_search_order(
-        closed_path_roots(),
-        config_path.empty() ? std::string() : std::filesystem::path(config_path).parent_path().string(),
-        user_directories()));
+    std::vector<std::string> roots;
+    for (const std::string& c : candidates) {
+        if (c.empty()) continue;
+        std::error_code ec;
+        if (!std::filesystem::exists(c + "/xclbins", ec)) continue;
+        if (std::find(roots.begin(), roots.end(), c) == roots.end()) roots.push_back(c);
+    }
+    return roots;
 }
 
 std::string find_xclbin_path() {
@@ -340,27 +373,6 @@ std::string find_xclbin_path() {
         if (!c.empty() && std::filesystem::exists(c + "/xclbins")) return c;
     }
     throw std::runtime_error("xclbins not found. Please set OFLM_XCLBIN_PATH or place it next to the executable.");
-}
-
-std::string first_root_holding(const std::vector<std::string>& roots, const std::string& relative) {
-    for (const std::string& r : roots) {
-        if (r.empty()) continue;
-        std::error_code ec;
-        if (std::filesystem::is_directory(std::filesystem::path(r) / relative, ec)) return r;
-    }
-    return std::string();
-}
-
-std::string find_xclbin_path_for(const std::string& name) {
-    // Per NAME, across every root (#30). find_xclbin_path() returns the first root
-    // whose xclbins/ exists at all, so a user root holding one linked model hid the
-    // install tree's other forty -- which is why oflm-add had to ask for exports.
-    if (!name.empty()) {
-        const std::string root = first_root_holding(xclbin_roots_install_first(),
-                                                    (std::filesystem::path("xclbins") / name).string());
-        if (!root.empty()) return root;
-    }
-    return find_xclbin_path();
 }
 
 std::string get_executable_directory() {

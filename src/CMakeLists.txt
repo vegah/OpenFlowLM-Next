@@ -1212,12 +1212,12 @@ add_test(NAME openai_compat
          COMMAND openai_compat_test "${CMAKE_CURRENT_SOURCE_DIR}/model_list.json")
 
 # user_dirs: where the application looks for registries, installed models and
-# kernel roots across the .oflm and pre-rename .flm user directories (#30), and
+# model_info.json across the .oflm and pre-rename .flm user directories (#30), and
 # how the built-in and user registries merge. NO device, NO weights, NO network:
 # it builds its directory trees under the system temp directory and calls the
 # same utils.cpp functions oflm does. Every defect it guards is a well-formed
-# wrong answer -- fewer models listed, a model pulled again, a kernel root that
-# does not hold the model -- so the smoke test cannot see any of them.
+# wrong answer -- fewer models listed, a model pulled again, an added model that
+# cannot be verified -- so the smoke test cannot see any of them.
 add_executable(user_dirs_test common/user_dirs_test.cpp common/utils.cpp)
 if(NOT WIN32)
     target_compile_options(user_dirs_test PRIVATE -mavx -mavx2)

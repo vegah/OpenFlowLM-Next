@@ -21,6 +21,7 @@
 /// (src/common/user_dirs_test.cpp).
 #pragma once
 #include "nlohmann/json.hpp"
+#include <fstream>
 #include <map>
 #include <utility>
 #include <string>
@@ -143,6 +144,48 @@ inline nlohmann::json merge(nlohmann::json base, const std::vector<Layer>& layer
         if (!added.empty() && report) report->sources.push_back({layer.path, added});
     }
     return base;
+}
+
+/// \brief merge user model_info.json files over the shipped one (#30)
+/// \note model_info.json is keyed by tag at the top level: each value lists a model's files
+///       with their sizes and hashes. Same two rules as merge(): a user file never
+///       replaces a shipped tag -- those hashes are what `oflm pull` checks downloads
+///       against -- and a later user file wins over an earlier one.
+inline nlohmann::json merge_model_info(nlohmann::json base, const std::vector<Layer>& layers) {
+    if (!base.is_object()) base = nlohmann::json::object();
+    const nlohmann::json shipped = base;
+    for (const Layer& layer : layers) {
+        if (!layer.doc.is_object()) continue;
+        for (const auto& [tag, files] : layer.doc.items()) {
+            if (shipped.contains(tag)) continue;
+            base[tag] = files;
+        }
+    }
+    return base;
+}
+
+/// \brief read and merge the files utils::find_model_infos() returns
+/// \param paths the shipped file (may be an empty string: none), then user files in merge order
+/// \note Silent, unlike the model list: this is read once per model on every `oflm list`,
+///       and a user file that cannot be read only means its models go unverified.
+/// \throw nlohmann::json::exception when the SHIPPED file exists but does not parse
+inline nlohmann::json load_model_info(const std::vector<std::string>& paths) {
+    nlohmann::json base = nlohmann::json::object();
+    std::vector<Layer> layers;
+    for (size_t i = 0; i < paths.size(); ++i) {
+        if (paths[i].empty()) continue;
+        std::ifstream f(paths[i]);
+        if (i == 0) {
+            if (f.is_open()) base = nlohmann::json::parse(f);
+            continue;
+        }
+        try {
+            if (f.is_open()) layers.push_back({paths[i], nlohmann::json::parse(f)});
+        } catch (const std::exception&) {
+            // A broken user file must not take the shipped entries down with it.
+        }
+    }
+    return merge_model_info(std::move(base), layers);
 }
 
 }  // namespace model_registry

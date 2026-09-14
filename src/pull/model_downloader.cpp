@@ -258,8 +258,7 @@ std::vector<std::string> ModelDownloader::get_missing_files(const std::string& m
         // reported; this only means the size check is skipped.
         nlohmann::json manifest;
         try {
-            std::ifstream mf(utils::find_model_info());
-            manifest = nlohmann::json::parse(mf).at(new_model_tag);
+            manifest = model_registry::load_model_info(utils::find_model_infos()).at(new_model_tag);
         } catch (const std::exception&) {}
 
         // Check each required model file
@@ -399,9 +398,9 @@ std::pair<nlohmann::json, float> ModelDownloader::build_download_list(const std:
         //     hf_model_infos = nlohmann::json::parse(hf_response);
         // }
         // else {
-        std::string model_info_path = utils::find_model_info();
-        std::ifstream model_info_file(model_info_path);
-        nlohmann::json model_info_json = nlohmann::json::parse(model_info_file);
+        // The shipped model_info.json with the user ones merged over it (#30), so a
+        // model `oflm add` registered is verified like a built-in one.
+        nlohmann::json model_info_json = model_registry::load_model_info(utils::find_model_infos());
         hf_model_infos = model_info_json.at(new_model_tag);
         // }
 
@@ -581,9 +580,9 @@ bool ModelDownloader::verify_and_clean_files(const std::string& model_tag, bool 
         //     hf_model_infos = nlohmann::json::parse(hf_response);
         // }
         // else {
-        std::string model_info_path = utils::find_model_info();
-        std::ifstream model_info_file(model_info_path);
-        nlohmann::json model_info_json = nlohmann::json::parse(model_info_file);
+        // The shipped model_info.json with the user ones merged over it (#30), so a
+        // model `oflm add` registered is verified like a built-in one.
+        nlohmann::json model_info_json = model_registry::load_model_info(utils::find_model_infos());
         hf_model_infos = model_info_json.at(new_model_tag);
         // }
 

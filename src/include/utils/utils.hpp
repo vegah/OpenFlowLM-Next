@@ -373,6 +373,14 @@ inline std::string path_join(fileName&&... args){
 std::vector<std::string> user_directories(const std::string& user_dir);
 std::vector<std::string> user_directories();
 
+///@brief the directories whose model_list.json and model_info.json are user registries, newest first
+///@param explicit_model_path $OFLM_MODEL_PATH (empty when unset)
+///@param user_dir what get_user_directory() returns
+///@return explicit_model_path when set -- `oflm add` writes its registry into the models
+///        directory -- then user_directories(user_dir)
+std::vector<std::string> registry_directories(const std::string& explicit_model_path, const std::string& user_dir);
+std::vector<std::string> registry_directories();
+
 ///@brief find and return the path to model_list.json
 ///@return $OFLM_CONFIG_PATH if it exists, else find_builtin_model_list()
 std::string find_model_list();
@@ -391,12 +399,17 @@ std::vector<std::string> builtin_model_list_candidates(const std::string& exe_di
 std::string first_builtin_model_list(const std::vector<std::string>& candidates,
                                      const std::vector<std::string>& user_dirs);
 
-///@brief every model_list.json to merge, in merge order (a later layer wins over an earlier
-///       USER layer; no layer replaces a built-in tag -- see model_registry.hpp)
-///@param builtin_path the base registry
-///@param user_dirs user_directories(), newest first
-///@return builtin_path, then each <dir>/model_list.json that exists, OLDEST first so the newest
-///        is applied last; a file equivalent to one already listed is skipped
+///@brief every file to merge, in merge order (a later layer wins over an earlier USER layer;
+///       no layer replaces a built-in entry -- see model_registry.hpp)
+///@param filename "model_list.json" or "model_info.json"
+///@param builtin_path the base file; may be empty when there is none
+///@param dirs registry_directories(), newest first
+///@return builtin_path (even when empty), then each <dir>/<filename> that exists, OLDEST first
+///        so the newest is applied last; a file equivalent to one already listed is skipped
+std::vector<std::string> registry_file_layers(const std::string& filename, const std::string& builtin_path,
+                                              const std::vector<std::string>& dirs);
+
+///@brief registry_file_layers("model_list.json", builtin_path, user_dirs)
 std::vector<std::string> model_list_layers(const std::string& builtin_path,
                                            const std::vector<std::string>& user_dirs);
 
@@ -408,11 +421,14 @@ std::vector<std::string> registry_layers(const std::string& explicit_path, const
                                          const std::vector<std::string>& user_dirs);
 
 ///@brief the model registries this process should read:
-///       registry_layers($OFLM_CONFIG_PATH, find_builtin_model_list(), user_directories()),
+///       registry_layers($OFLM_CONFIG_PATH, find_builtin_model_list(), registry_directories()),
 ///       saying on stderr which case applied
 ///@throw std::runtime_error when there is neither an explicit nor a built-in registry
 std::vector<std::string> find_model_lists();
 
+///@brief the one model_info.json the application ships: $OFLM_MODELINFO_PATH, beside
+///       $OFLM_CONFIG_PATH, then model_info_candidates()
+///@throw std::runtime_error when none exists
 std::string find_model_info();
 
 ///@brief where find_model_info() looks after the environment variables, in order
@@ -420,40 +436,23 @@ std::string find_model_info();
 ///        <install_prefix>/share/oflm/model_info.json -- the same on every platform
 std::vector<std::string> model_info_candidates(const std::string& exe_dir, const std::string& install_prefix);
 
+///@brief every model_info.json to merge (#30): {$OFLM_MODELINFO_PATH} when that names an
+///       existing file, else registry_file_layers("model_info.json", <the shipped one or "">,
+///       registry_directories()). Read with model_registry::load_model_info().
+///@throw std::runtime_error when there is no model_info.json anywhere
+std::vector<std::string> find_model_infos();
+
 
 ///@brief every directory that may hold an `xclbins/` tree, most specific first
 ///@return the roots whose <root>/xclbins exists: $OFLM_XCLBIN_PATH, the directory
-///        holding $OFLM_CONFIG_PATH, user_directories(), the executable's directory,
-///        the CWD, <exe>/../share/oflm, then the configured prefix. `find_xclbin_path`
-///        walks only $OFLM_XCLBIN_PATH and the last four.
+///        holding $OFLM_CONFIG_PATH, the user-level oflm config directory, the
+///        executable's directory, the CWD, <exe>/../share/oflm, then the configured
+///        prefix. `find_xclbin_path` is the first entry of this list.
 std::vector<std::string> xclbin_roots();
 
 ///@brief get the path to the xclbin directory
 ///@return path to the xclbin directory
 std::string find_xclbin_path();
-
-///@brief the first root in `roots` holding the directory <root>/<relative>
-///@return that root, or an empty string when none does
-std::string first_root_holding(const std::vector<std::string>& roots, const std::string& relative);
-
-///@brief the order a NAMED kernel directory is looked up in: the install tree first
-///@param install_roots $OFLM_XCLBIN_PATH, then the executable's directory, the CWD,
-///       <exe>/../share/oflm and the configured prefix
-///@param config_dir the directory holding $OFLM_CONFIG_PATH, or empty
-///@param user_dirs user_directories()
-///@return install_roots, config_dir, user_dirs -- a user directory cannot replace a shipped
-///        kernel, the way a user registry cannot replace a built-in model
-std::vector<std::string> xclbin_search_order(const std::vector<std::string>& install_roots,
-                                             const std::string& config_dir,
-                                             const std::vector<std::string>& user_dirs);
-
-///@brief xclbin_search_order() for this process, filtered to roots whose xclbins/ exists
-std::vector<std::string> xclbin_roots_install_first();
-
-///@brief the root whose xclbins/<name> exists, searched per name over xclbin_roots_install_first() (#30)
-///@return that root; find_xclbin_path() when no root holds <name>
-///@throw std::runtime_error when there is no xclbins tree at all
-std::string find_xclbin_path_for(const std::string& name);
 
 ///@brief get_server_port gets the server port from environment variable OFLM_SERVE_PORT
 ///@return the server port, default is 52625 if environment variable is not set

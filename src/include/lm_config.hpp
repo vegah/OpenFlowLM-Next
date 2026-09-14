@@ -96,14 +96,8 @@ class LM_Config{
                 // must never abort `oflm pull`, `oflm list`, or model loading.
                 // Leave exec_path empty and let kernel lookup fail later, only
                 // if a model actually needs kernels from there.
-                //
-                // The root holding xclbins/<this model>, not merely the first root with
-                // an xclbins/ at all (#30): a model oflm-add linked under the user
-                // directory and the models shipped in the install tree are both
-                // reachable without exporting OFLM_XCLBIN_PATH.
                 try {
-                    this->exec_path = utils::find_xclbin_path_for(
-                        std::filesystem::path(model_name).filename().string());
+                    this->exec_path = utils::find_xclbin_path();
                 } catch (const std::exception&) {
                     this->exec_path.clear();
                 }

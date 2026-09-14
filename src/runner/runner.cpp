@@ -480,16 +480,25 @@ void Runner::cmd_load(std::vector<std::string>& input_list) {
 /// \param input_list, std::vector<std::string>
 void Runner::cmd_save(std::vector<std::string>& input_list) {
     std::pair<std::string, std::vector<int>> history = this->auto_chat_engine->get_history();
-    // The history directory lives in the models directory, on every platform. The POSIX
-    // branch used to read OFLM_MODEL_PATH with a bare getenv and build ~/.config/oflm by
-    // hand, so it saw neither the pre-rename FLM_MODEL_PATH nor a pre-rename directory
-    // that get_models_directory() resolves (#30).
-#ifdef _WIN32
-    const char* path_sep = "\\";
-#else
+    // Get the OFLM_MODEL_PATH environment variable for the history directory
+    std::string history_dir;
     const char* path_sep = "/";
+#ifdef _WIN32
+    path_sep = "\\";
+    char* model_path_env = nullptr;
+    size_t len = 0;
+
+    history_dir = utils::get_models_directory() + path_sep + "history";
+
+#else
+    const char* model_path_env = std::getenv("OFLM_MODEL_PATH");
+    if (model_path_env && *model_path_env) {
+        history_dir = std::string(model_path_env) + path_sep + "history";
+    } else {
+        std::string documents_dir = utils::get_user_directory();
+        history_dir = documents_dir + path_sep + "oflm" + path_sep + "history";
+    }
 #endif
-    std::string history_dir = utils::get_models_directory() + path_sep + "history";
     
     // Create the history directory if it doesn't exist
     if (!std::filesystem::exists(history_dir)) {

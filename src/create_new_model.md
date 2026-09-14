@@ -293,7 +293,7 @@ Model resolution at runtime (`specs/user-directory/spec.md`):
 the registry is the built-in `model_list.json` with every user-level one merged over it
 (or exactly `$OFLM_CONFIG_PATH` when set); `get_model_path(tag)` =
 `<root>/<model_path>/<name>` for the first root in `utils::models_directories()`
-(`$OFLM_MODEL_PATH`, or the `.oflm`/`.flm` user directories) that holds it, else under
+(`$OFLM_MODEL_PATH`, or the `.oflm`/`.flm` user directories) holding a complete copy, else under
 `get_models_directory()`.
 
 ---

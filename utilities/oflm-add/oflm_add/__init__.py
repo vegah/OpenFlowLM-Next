@@ -30,13 +30,10 @@ writes a user-level registry at ~/.config/oflm/model_list.json and adds a single
 symlink into ~/.config/oflm/xclbins/ for the new model directory. Custom OFLM
 models never ship xclbins (they are closed source), so the kernel symlink is
 always taken from the matching official model, keyed by family (engine) and
-size -- e.g. Darwin-36B-Opus-NPU2 -> Qwen3.6-35B-A3B-NPU2.
+size -- e.g. Darwin-36B-Opus-NPU2 -> Qwen3.6-35B-A3B-NPU2. The only thing
+you need in your shell rc afterwards is:
 
-With the default paths no environment variable is needed afterwards: OpenFlowLM
-merges every user-level model_list.json over its built-in one and looks for
-models and xclbins in the user directories by name (#30). A user registry
-therefore holds only what was added, never a copy of the built-in entries --
-unless OFLM_CONFIG_PATH names it, because then it is the whole registry.
+    OFLM_CONFIG_PATH="$HOME/.config/oflm/model_list.json" OFLM_XCLBIN_PATH="$HOME/.config/oflm"
 """
 
 import argparse
@@ -170,11 +167,9 @@ def user_xclbin_dir(arg):
 def user_registry_path(arg):
     if arg:
         return Path(arg)
-    # OFLM_CONFIG_PATH only when it names a registry of the user's own; oflm_env.sh
-    # (home_install.sh) points it at the install's built-in list, which is not ours to edit.
-    env = whole_registry_env()
-    if env is not None:
-        return env
+    env = os.environ.get("OFLM_CONFIG_PATH")
+    if env:
+        return Path(env)
     return Path.home() / ".config" / "oflm" / "model_list.json"
 
 
@@ -185,117 +180,6 @@ def models_root_dir(arg):
     if env:
         return Path(env) / "models"
     return Path.home() / ".config" / "oflm" / "models"
-
-
-# ------------------------------------------------- what the engine reads (#30)
-#
-# These mirror src/common/utils.cpp. The engine reads each OFLM_* variable and
-# falls back to its pre-rename FLM_* name, and with neither set it searches the
-# user directories itself -- so whether an export is needed is a question about
-# the paths, not a fixed instruction.
-
-def _engine_env(name):
-    """An OFLM_* variable as utils::getenv_oflm reads it: OFLM_X, then FLM_X."""
-    return os.environ.get(name) or os.environ.get(name[1:]) or None
-
-
-def engine_user_directories():
-    """utils::user_directories(): the user directories, newest name first.
-
-    The engine's user directory is the profile on Windows and ~/.config on POSIX.
-    """
-    home = Path.home()
-    if os.name == "nt":
-        return [home / ".oflm", home / ".config" / "oflm", home / ".flm", home / ".config" / "flm"]
-    return [home / ".config" / "oflm", home / ".config" / "flm"]
-
-
-def _same_path(a, b):
-    try:
-        return Path(a).resolve() == Path(b).resolve()
-    except OSError:
-        return False
-
-
-def builtin_registry_candidates():
-    """Where the engine's built-in model_list.json may be (utils::builtin_model_list_candidates)."""
-    exe = shutil.which("oflm")
-    candidates = []
-    if exe:
-        candidates.append(Path(exe).parent / "model_list.json")
-        candidates.append(Path(exe).parent.parent / "share" / "oflm" / "model_list.json")
-    candidates += [Path(p) for p in SYSTEM_LIST_CANDIDATES]
-    return candidates
-
-
-def whole_registry_env():
-    """OFLM_CONFIG_PATH as a Path when the engine would read it as the WHOLE registry, else None.
-
-    utils::registry_layers(): a variable naming the built-in list itself is not a
-    custom registry, and the user registries are merged over it anyway.
-    """
-    env = _engine_env("OFLM_CONFIG_PATH")
-    if not env or any(_same_path(env, c) for c in builtin_registry_candidates()):
-        return None
-    return Path(env)
-
-
-def engine_reads_whole_registry(path):
-    """True when the engine reads `path` as its ENTIRE registry: OFLM_CONFIG_PATH names it."""
-    env = whole_registry_env()
-    return env is not None and _same_path(env, path)
-
-
-def engine_merges_registry(path):
-    """True when the engine merges `path` over its built-in registry on its own.
-
-    utils::find_model_lists(): <user dir>/model_list.json for every user directory,
-    unless OFLM_CONFIG_PATH names a custom registry. A variable naming a file that
-    does not exist is ignored by the engine -- except that `path` itself is about to
-    be written, so a variable naming `path` counts.
-    """
-    env = whole_registry_env()
-    if env is not None and (env.is_file() or _same_path(env, path)):
-        return False
-    return any(_same_path(d / "model_list.json", path) for d in engine_user_directories())
-
-
-def shell_setup(user_list, xclbin_dir, models_root):
-    """What the engine needs to be told to see this install.
-
-    Returns (exports, warnings): `exports` as (name, value) pairs, empty with the
-    default paths; `warnings` for a location no export can fix without hiding
-    something else.
-    """
-    exports, warnings = [], []
-    if not (engine_merges_registry(user_list) or engine_reads_whole_registry(user_list)):
-        exports.append(("OFLM_CONFIG_PATH", str(user_list)))
-
-    # utils::xclbin_roots(): $OFLM_XCLBIN_PATH, the directory holding
-    # $OFLM_CONFIG_PATH, then the user directories -- searched per model name.
-    xclbin_root = xclbin_dir.parent if xclbin_dir.name == "xclbins" else xclbin_dir
-    config_env = whole_registry_env()
-    known = list(engine_user_directories())
-    if _engine_env("OFLM_XCLBIN_PATH"):
-        env_root = Path(_engine_env("OFLM_XCLBIN_PATH"))
-        known.append(env_root.parent if env_root.name == "xclbins" else env_root)
-    if config_env:
-        known.append(Path(config_env).parent)
-    elif exports:
-        known.append(Path(user_list).parent)   # once OFLM_CONFIG_PATH is exported as advised
-    if not any(_same_path(k, xclbin_root) for k in known):
-        exports.append(("OFLM_XCLBIN_PATH", str(xclbin_root)))
-
-    # utils::models_directories(): $OFLM_MODEL_PATH alone, or the user directories.
-    model_env = _engine_env("OFLM_MODEL_PATH")
-    stores = [Path(model_env)] if model_env else engine_user_directories()
-    if not any(_same_path(s / "models", models_root) for s in stores):
-        warnings.append(
-            f"OpenFlowLM does not look for models in {models_root}. Setting "
-            f"OFLM_MODEL_PATH={Path(models_root).parent} would make it the ONLY models "
-            "directory; installing under the default --models-root does not."
-        )
-    return exports, warnings
 
 
 # ---------------------------------------------------------------- tag derivation
@@ -723,15 +607,7 @@ def build_entry(base_entry, dir_name, files, size):
 def register(user_list_path, tag, entry, system_registry):
     if user_list_path.is_file():
         registry = load_json(user_list_path)
-    elif engine_merges_registry(user_list_path):
-        # The engine merges this file over its built-in registry (#30), so it holds
-        # what was added and nothing else. A copy of the built-in entries would go
-        # stale the day the application ships a new model -- and the merge ignores
-        # them anyway, since a user file cannot replace a built-in tag.
-        registry = {"model_path": "models", "models": {}}
     else:
-        # Read only through OFLM_CONFIG_PATH, i.e. as the WHOLE registry: without
-        # the built-in entries every official model would disappear.
         registry = json.loads(json.dumps(system_registry))
     registry.setdefault("model_path", "models")
     model_type, size = tag.split(":", 1)
@@ -1078,14 +954,8 @@ def main():
     print()
     print(f"Done: {dir_name} installed to {target}")
     print(f"Run:  oflm run {tag}   (or: oflm serve {tag})")
-    exports, warnings = shell_setup(user_list, user_xclbin_dir(args.xclbin_dir), models_root)
     print()
-    if exports:
-        print("OpenFlowLM will not find this install on its own. Add to your shell rc:")
-        for name, value in exports:
-            print(f'    export {name}="{value}"')
-    else:
-        print("No environment variables needed: OpenFlowLM reads this registry and these paths itself.")
-    for w in warnings:
-        log(f"[WARN] {w}")
+    print("Make sure your shell has these exports (add to ~/.bashrc):")
+    print('    export OFLM_CONFIG_PATH="$HOME/.config/oflm/model_list.json"')
+    print('    export OFLM_XCLBIN_PATH="$HOME/.config/oflm"')
 

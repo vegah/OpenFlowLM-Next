@@ -57,8 +57,8 @@ oflm-add . --tag qwen3.5-claude:9b
 
 1. Reads `config.json` from the target model directory to extract metadata (family, engine, size, context length).
 2. Validates that all required files exist (`model.q4nx`, `tokenizer.json`, etc.).
-3. Writes a user-level registry at `$OFLM_CONFIG_PATH` (default: `~/.config/oflm/model_list.json`). OpenFlowLM merges a registry in a user directory over its built-in one, so with the default path that file holds only what `oflm-add` added and no environment variable is needed. A file `OFLM_CONFIG_PATH` names is read as the *whole* registry instead, so it starts as a copy of the built-in one.
-4. Adds a symlink into `$OFLM_XCLBIN_PATH/xclbins/` (default: `~/.config/oflm/xclbins/`, which OpenFlowLM searches by model name without an export) pointing to the model's kernel folder (`model.q4nx.xbin`). The xclbin directory name is taken from the matching official OpenFlowLM entry, keyed by family and size (e.g., `Darwin-36B-Opus-NPU2 -> Qwen3.6-35B-A3B-NPU2`). Custom OFLM models never ship xclbins because they are closed source binaries; the kernel symlink always comes from the official model it matches.
+3. Writes a user-level registry at `$OFLM_CONFIG_PATH/model_list.json` (default: `~/.config/oflm/model_list.json`).
+4. Adds a symlink into `$OFLM_XCLBIN_PATH/xclbins/` pointing to the model's kernel folder (`model.q4nx.xbin`). The xclbin directory name is taken from the matching official OpenFlowLM entry, keyed by family and size (e.g., `Darwin-36B-Opus-NPU2 -> Qwen3.6-35B-A3B-NPU2`). Custom OFLM models never ship xclbins because they are closed source binaries; the kernel symlink always comes from the official model it matches.
 5. Links the **open kernel set** that matches the model, if one is installed (step 4's rule does not apply to it — see below).
 
 ### Open kernels are matched by spec, not by model name

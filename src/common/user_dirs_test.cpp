@@ -1,12 +1,12 @@
 /// \file user_dirs_test.cpp
 /// \brief Unit tests for the user-directory search (#30): which registries are read
-///        and merged, where an installed model is found, which xclbins root serves a
-///        model, and where model_info.json is looked for.
+///        and merged, where an installed model is found, and which model_info.json
+///        files verify it.
 ///
 /// Every defect here is a well-formed wrong answer. A registry that is not read
 /// shows fewer models; a model looked up in the wrong directory shows as "not
-/// downloaded" and is pulled again; a kernel root chosen per directory rather than
-/// per model loads nothing for the model you asked for. None of it crashes.
+/// downloaded" and is pulled again; a model_info.json nobody merges leaves an added
+/// model unverifiable. None of it crashes.
 ///
 /// No device, no weights, no network. Everything runs in a temporary directory,
 /// through the same functions the application calls: the functions that normally
@@ -276,57 +276,37 @@ static void test_models_search_roots() {
 }
 
 // ---------------------------------------------------------------------------
-// USERDIR-XCLBIN-PER-NAME: a kernel root is chosen per model.
+// USERDIR-REGISTRY-DIRS: where user registries are looked for.
 // ---------------------------------------------------------------------------
-static void test_xclbin_per_name(const fs::path& tmp) {
-    std::printf("\n-- find_xclbin_path_for --\n");
-    const fs::path a = tmp / "xa", b = tmp / "xb";
-    fs::create_directories(a / "xclbins" / "Linked-NPU2");
-    fs::create_directories(b / "xclbins" / "Shipped-NPU2");
-    write_json(b / "model_list.json", json::object());
+static void test_registry_directories() {
+    std::printf("\n-- registry_directories --\n");
+    ok(utils::registry_directories("", "U") == utils::user_directories("U"),
+       "no OFLM_MODEL_PATH: the user directories");
+    const auto e = utils::registry_directories("M", "U");
+    ok(!e.empty() && e[0] == "M" && e.size() == utils::user_directories("U").size() + 1,
+       "OFLM_MODEL_PATH (where `oflm add` writes its registry) first, then the user directories");
+}
 
-    eq(utils::first_root_holding({"", a.string(), b.string()}, "xclbins/Shipped-NPU2"), b.string(),
-       "first_root_holding skips a root whose xclbins/ lacks the name");
-    eq(utils::first_root_holding({a.string()}, "xclbins/Missing"), "", "...and returns empty when none has it");
-
-    const auto order = utils::xclbin_search_order({"ENV", "EXE", "SHARE"}, "CFG", {"U1", "U2"});
-    ok(order == std::vector<std::string>{"ENV", "EXE", "SHARE", "CFG", "U1", "U2"},
-       "named kernels: $OFLM_XCLBIN_PATH and the install tree before the user directories");
-    // The q4nx-build mirror case: the same name under a user directory and the install tree.
-    const fs::path inst = tmp / "xinst", user = tmp / "xuser";
-    fs::create_directories(inst / "xclbins" / "Qwen3-8B-NPU2");
-    fs::create_directories(user / "xclbins" / "Qwen3-8B-NPU2");
-    fs::create_directories(user / "xclbins" / "Linked-8B-NPU2");
-    const auto o2 = utils::xclbin_search_order({inst.string()}, "", {user.string()});
-    eq(utils::first_root_holding(o2, "xclbins/Qwen3-8B-NPU2"), inst.string(),
-       "a shipped kernel is served from the install tree even when a user directory mirrors it");
-    eq(utils::first_root_holding(o2, "xclbins/Linked-8B-NPU2"), user.string(),
-       "a name only a user directory holds is served from there");
-
-    // OFLM_XCLBIN_PATH names root A; the directory holding OFLM_CONFIG_PATH is root B.
-    set_env("FLM_XCLBIN_PATH", "");
+// ---------------------------------------------------------------------------
+// USERDIR-REGISTRY-LAYERS with an explicit OFLM_CONFIG_PATH, through the real function.
+// ---------------------------------------------------------------------------
+static void test_find_model_lists_explicit(const fs::path& tmp) {
+    std::printf("\n-- find_model_lists with OFLM_CONFIG_PATH --\n");
+    const fs::path custom = tmp / "explicit" / "model_list.json";
+    write_json(custom, builtin_registry());
     set_env("FLM_CONFIG_PATH", "");
-    set_env("OFLM_XCLBIN_PATH", a.string());
-    set_env("OFLM_CONFIG_PATH", (b / "model_list.json").string());
-    ok(same(utils::find_xclbin_path(), a.string()), "find_xclbin_path() still returns the first root (A)");
-    ok(same(utils::find_xclbin_path_for("Linked-NPU2"), a.string()), "a model under A is served from A");
-    ok(same(utils::find_xclbin_path_for("Shipped-NPU2"), b.string()),
-       "a model only under B is served from B, not from the first root");
-    ok(same(utils::find_xclbin_path_for("Nowhere-NPU2"), a.string()),
-       "a model under no root falls back to find_xclbin_path()");
-
+    set_env("OFLM_CONFIG_PATH", custom.string());
     const auto lists = utils::find_model_lists();
-    ok(lists.size() == 1 && same(lists[0], (b / "model_list.json").string()),
-       "find_model_lists(): an explicit OFLM_CONFIG_PATH is the whole registry");
-    set_env("OFLM_XCLBIN_PATH", "");
+    ok(lists.size() == 1 && same(lists[0], custom.string()),
+       "an explicit custom OFLM_CONFIG_PATH is the whole registry");
     set_env("OFLM_CONFIG_PATH", "");
 }
 
 // ---------------------------------------------------------------------------
-// USERDIR-MODEL-INFO: the same installed locations on every platform.
+// USERDIR-MODEL-INFO: the shipped model_info.json, then the user ones merged by tag.
 // ---------------------------------------------------------------------------
-static void test_model_info_candidates() {
-    std::printf("\n-- model_info_candidates --\n");
+static void test_model_info(const fs::path& tmp) {
+    std::printf("\n-- model_info.json --\n");
     const auto c = utils::model_info_candidates("E", "P");
     eqi((long long)c.size(), 3, "three installed locations");
     if (c.size() == 3) {
@@ -335,6 +315,60 @@ static void test_model_info_candidates() {
            "the relocatable bundle (the Windows branch used to stop before this)");
         eq(c[2], (fs::path("P") / "share" / "oflm" / "model_info.json").string(), "the configured prefix");
     }
+
+    const json shipped = {{"qwen3:8b", json::array({{{"path", "model.q4nx"}, {"size", 1}}})}};
+    const json older = {{"mine:1b", json::array({{{"path", "old"}}})},
+                        {"qwen3:8b", json::array({{{"path", "model.q4nx"}, {"size", 999}}})}};
+    const json newer = {{"mine:1b", json::array({{{"path", "new"}}})},
+                        {"mine:2b", json::array({{{"path", "x"}}})}};
+    const json m = model_registry::merge_model_info(shipped, {{"older", older}, {"newer", newer}});
+    eqi(m["qwen3:8b"][0]["size"].get<long long>(), 1, "a user model_info.json cannot replace a shipped tag's hashes");
+    eq(m["mine:1b"][0]["path"].get<std::string>(), "new", "a newer user file wins over an older one");
+    ok(m.contains("mine:2b"), "a user tag is added");
+
+    // On files: the layer order, and a missing shipped file.
+    const fs::path home = tmp / "info_home";
+    const auto dirs = utils::user_directories(home.string());
+    const fs::path base = tmp / "info_share" / "model_info.json";
+    write_json(base, shipped);
+    write_json(fs::path(dirs.back()) / "model_info.json", older);
+    write_json(fs::path(dirs.front()) / "model_info.json", newer);
+    auto layers = utils::registry_file_layers("model_info.json", base.string(), dirs);
+    eqi((long long)layers.size(), 3, "shipped file, then the user files");
+    const json loaded = model_registry::load_model_info(layers);
+    ok(loaded.contains("qwen3:8b") && loaded.contains("mine:2b") &&
+           loaded["mine:1b"][0]["path"] == "new",
+       "load_model_info reads and merges them");
+    layers = utils::registry_file_layers("model_info.json", "", dirs);
+    const json no_base = model_registry::load_model_info(layers);
+    ok(no_base.contains("mine:2b") && no_base.contains("qwen3:8b") && no_base["qwen3:8b"][0]["size"] == 999,
+       "with no shipped file every user entry loads, even under a tag the shipped file would own");
+    std::ofstream(fs::path(dirs.front()) / "model_info.json") << "{ not json";
+    const json broken = model_registry::load_model_info(utils::registry_file_layers("model_info.json", base.string(), dirs));
+    ok(broken.contains("qwen3:8b") && broken.contains("mine:1b"),
+       "a broken user file is skipped; the shipped and other user entries remain");
+
+    // find_model_infos() on this process: a model_info.json in OFLM_MODEL_PATH is the newest layer.
+    const fs::path store = tmp / "info_store";
+    write_json(store / "model_info.json", newer);
+    set_env("FLM_MODEL_PATH", "");
+    set_env("FLM_MODELINFO_PATH", "");
+    set_env("OFLM_MODEL_PATH", store.string());
+    try {
+        const auto infos = utils::find_model_infos();
+        ok(!infos.empty() && same(infos.back(), (store / "model_info.json").string()),
+           "find_model_infos(): the model_info.json `oflm add` writes into OFLM_MODEL_PATH is read");
+    } catch (const std::exception& e) {
+        ok(false, std::string("find_model_infos() threw: ") + e.what());
+    }
+    const fs::path only = tmp / "info_explicit" / "model_info.json";
+    write_json(only, shipped);
+    set_env("OFLM_MODELINFO_PATH", only.string());
+    const auto explicit_infos = utils::find_model_infos();
+    ok(explicit_infos.size() == 1 && same(explicit_infos[0], only.string()),
+       "an explicit OFLM_MODELINFO_PATH is the whole file");
+    set_env("OFLM_MODELINFO_PATH", "");
+    set_env("OFLM_MODEL_PATH", "");
 }
 
 int main() {
@@ -344,12 +378,13 @@ int main() {
     fs::create_directories(tmp);
 
     test_user_directories();
+    test_registry_directories();
     test_model_list_layers(tmp);
+    test_find_model_lists_explicit(tmp);
     test_merge();
     test_model_list(tmp);
     test_models_search_roots();
-    test_xclbin_per_name(tmp);
-    test_model_info_candidates();
+    test_model_info(tmp);
 
     fs::remove_all(tmp, ec);
     std::printf("\n%s (%d checks, %d failures)\n", failures ? "FAILED" : "PASS", checks, failures);
